@@ -104,12 +104,11 @@ type SharedState = Arc<Mutex<AppState>>;
 
 fn init_db() -> Connection {
     let mut conn = Connection::open("quant_history.db").expect("SQLite veritabanı açılamadı!");
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;").unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", []).unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", []).unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;");
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", []);
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", []);
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []);
     
-    // Migration check for legacy column name if exists
     let column_exists: Result<i32, _> = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('active_positions') WHERE name='highest_price'",
         [],
@@ -281,8 +280,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
             Ok(tickers) => {
                 let mut state = match shared_state.lock() { Ok(s) => s.clone(), Err(_) => { thread::sleep(Duration::from_secs(1)); continue; } };
                 let mut realized_pnl_usd = 0.0;
-                let mut closed_count = 0;
-                let mut success_count = 0;
                 let mut still_active = Vec::new();
                 let mut current_err = String::from("Sistem Kararlı Çalışıyor (Simülasyon Modu)");
 
@@ -314,15 +311,14 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             let mut close_reason = None;
                             if pos.side == "LONG" {
                                 if curr_price <= pos.stop_loss { close_reason = Some("SL Hit - ReduceOnly".to_string()); }
-                                else if curr_price >= pos.take_profit { close_reason = Some("TP Hit - ReduceOnly".to_string()); success_count += 1; }
+                                else if curr_price >= pos.take_profit { close_reason = Some("TP Hit - ReduceOnly".to_string()); }
                             } else {
                                 if curr_price >= pos.stop_loss { close_reason = Some("SL Hit - ReduceOnly".to_string()); }
-                                else if curr_price <= pos.take_profit { close_reason = Some("TP Hit - ReduceOnly".to_string()); success_count += 1; }
+                                else if curr_price <= pos.take_profit { close_reason = Some("TP Hit - ReduceOnly".to_string()); }
                             }
                             if let Some(reason) = close_reason {
                                 pos.lifecycle = PositionLifecycle::Closed;
                                 realized_pnl_usd += pos.pnl_usd;
-                                closed_count += 1;
                                 
                                 state.accounting.current_balance += realized_pnl_usd;
                                 if state.accounting.starting_balance > 0.0 { 
