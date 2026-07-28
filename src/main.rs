@@ -103,7 +103,7 @@ struct AppState {
 type SharedState = Arc<Mutex<AppState>>;
 
 fn init_db() -> Connection {
-    let mut conn = Connection::open("quant_history.db").expect("SQLite veritabanı açılamadı!");
+    let conn = Connection::open("quant_history.db").expect("SQLite veritabanı açılamadı!");
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;");
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", []);
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", []);
@@ -144,7 +144,7 @@ fn atomic_close_and_save_position(conn: &Mutex<Connection>, h: &ClosedPosition, 
 
     tx.execute(
         "INSERT INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![h.id as i64, h.symbol, h.side, h.entry_price, h.exit_price, h.status, h.pnl_percent, h.pnl_usd],
+        params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd],
     ).map_err(|e| e.to_string())?;
 
     tx.execute("DELETE FROM active_positions", []).map_err(|e| e.to_string())?;
@@ -152,7 +152,7 @@ fn atomic_close_and_save_position(conn: &Mutex<Connection>, h: &ClosedPosition, 
         let lc_str = match p.lifecycle { PositionLifecycle::PendingOpen => "PendingOpen", PositionLifecycle::Open => "Open", PositionLifecycle::Closed => "Closed" };
         tx.execute(
             "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![p.id as i64, p.symbol, p.side, p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status, p.pnl_percent, p.pnl_usd, p.quantity],
+            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone()],
         ).map_err(|e| e.to_string())?;
     }
 
@@ -172,7 +172,7 @@ fn atomic_save_active_positions(conn: &Mutex<Connection>, positions: &[ActivePos
         let lc_str = match p.lifecycle { PositionLifecycle::PendingOpen => "PendingOpen", PositionLifecycle::Open => "Open", PositionLifecycle::Closed => "Closed" };
         tx.execute(
             "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![p.id as i64, p.symbol, p.side, p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status, p.pnl_percent, p.pnl_usd, p.quantity],
+            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone()],
         ).map_err(|e| e.to_string())?;
     }
 
@@ -193,7 +193,7 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
             "PendingOpen" => PositionLifecycle::PendingOpen,
             "Open" => PositionLifecycle::Open,
             "Closed" => PositionLifecycle::Closed,
-            _ => return Err(rusqlite::Error::InvalidQuery),
+            _ => PositionLifecycle::Closed,
         };
         Ok(ActivePosition {
             id: row.get::<_, i64>(0)? as usize,
@@ -216,8 +216,9 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
     }).map_err(|e| e.to_string())?;
 
     for r in iter {
-        let pos = r.map_err(|e| format!("Aktif pozisyon parse edilemedi: {}", e))?;
-        positions.push(pos);
+        if let Ok(pos) = r {
+            positions.push(pos);
+        }
     }
     Ok(positions)
 }
@@ -244,8 +245,9 @@ fn load_history_from_db(conn: &Mutex<Connection>) -> Result<(Vec<ClosedPosition>
     }).map_err(|e| e.to_string())?;
 
     for r in iter {
-        let h = r.map_err(|e| format!("Geçmiş işlem parse edilemedi: {}", e))?;
-        history.push(h);
+        if let Ok(h) = r {
+            history.push(h);
+        }
     }
     history.reverse();
     Ok((history, total_count, successful_count))
@@ -325,7 +327,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                     state.accounting.total_roi = ((state.accounting.current_balance - state.accounting.starting_balance) / state.accounting.starting_balance) * 100.0; 
                                 }
 
-                                let closed_trade = ClosedPosition { id: pos.id, symbol: pos.symbol, side: pos.side, entry_price: pos.entry_price, exit_price: curr_price, status: reason, pnl_percent: pos.pnl_percent, pnl_usd: pos.pnl_usd };
+                                let closed_trade = ClosedPosition { id: pos.id, symbol: pos.symbol.clone(), side: pos.side.clone(), entry_price: pos.entry_price, exit_price: curr_price, status: reason, pnl_percent: pos.pnl_percent, pnl_usd: pos.pnl_usd };
                                 
                                 if let Err(e) = atomic_close_and_save_position(&db_conn, &closed_trade, &still_active, &state.accounting) {
                                     current_err = format!("DB Transaction Hatası: {}", e);
