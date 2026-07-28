@@ -109,7 +109,7 @@ fn init_db() -> Connection {
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", []);
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []);
     
-    let column_exists: Result<i32, _> = conn.query_row(
+    let column_exists: Result<i64, _> = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info('active_positions') WHERE name='highest_price'",
         [],
         |row| row.get(0)
@@ -227,8 +227,8 @@ fn load_history_from_db(conn: &Mutex<Connection>) -> Result<(Vec<ClosedPosition>
     let mut history = Vec::new();
     let c = conn.lock().map_err(|e| e.to_string())?;
     
-    let total_count: usize = c.query_row("SELECT COUNT(*) FROM closed_trades", [], |row| row.get(0)).unwrap_or(0);
-    let successful_count: usize = c.query_row("SELECT COUNT(*) FROM closed_trades WHERE pnl_percent > 0", [], |row| row.get(0)).unwrap_or(0);
+    let total_count: usize = c.query_row("SELECT COUNT(*) FROM closed_trades", [], |row| row.get::<_, i64>(0)).unwrap_or(0) as usize;
+    let successful_count: usize = c.query_row("SELECT COUNT(*) FROM closed_trades WHERE pnl_percent > 0", [], |row| row.get::<_, i64>(0)).unwrap_or(0) as usize;
 
     let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
     let iter = stmt.query_map([], |row| {
