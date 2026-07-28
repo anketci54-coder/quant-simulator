@@ -12,3 +12,5 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 dotenvy = "0.15.7"
+anyhow = "1.0.104"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
