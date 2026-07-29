@@ -1,15 +1,14 @@
 use dotenvy::dotenv;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::{Response, Server};
 
-const MAX_POSITIONS: usize = 10;
-const POSITION_MARGIN_USDT: f64 = 100.0;
+const MAX_POSITION_MARGIN_USDT: f64 = 100.0;
 const FEE_RATE_PERCENT: f64 = 0.04;
 const BREAKEVEN_BUFFER_RATE: f64 = 0.001;
 
@@ -69,6 +68,39 @@ fn break_even_stop(side: &str, entry: f64) -> Option<f64> {
     }
 }
 
+fn calculate_position_size(
+    balance: f64,
+    entry: f64,
+    stop: f64,
+    leverage: f64,
+    risk_fraction: f64,
+    filters: &SymbolFilters,
+) -> Option<(f64, f64, f64)> {
+    if balance <= 0.0 || entry <= 0.0 || leverage <= 0.0 || !(0.0..=1.0).contains(&risk_fraction) {
+        return None;
+    }
+    let stop_distance = (entry - stop).abs();
+    if stop_distance <= 0.0 {
+        return None;
+    }
+    let risk_qty = (balance * risk_fraction) / stop_distance;
+    let margin_capped_qty = (MAX_POSITION_MARGIN_USDT * leverage) / entry;
+    let raw_qty = risk_qty.min(margin_capped_qty);
+    let qty = quantize_quantity(raw_qty, filters)?;
+    let margin = (qty * entry) / leverage;
+    let risk = qty * stop_distance;
+    Some((qty, margin, risk))
+}
+
+fn position_risk(position: &ActivePosition) -> f64 {
+    position
+        .quantity
+        .parse::<f64>()
+        .ok()
+        .map(|qty| qty * (position.entry_price - position.stop_loss).abs())
+        .unwrap_or(0.0)
+}
+
 fn quantize_quantity(raw_qty: f64, filters: &SymbolFilters) -> Option<f64> {
     if !raw_qty.is_finite() || raw_qty <= 0.0 || filters.step_size <= 0.0 {
         return None;
@@ -91,6 +123,16 @@ enum PositionLifecycle {
 #[derive(Clone)]
 struct Config {
     base_url: String,
+    entry_enabled: bool,
+    max_positions: usize,
+    risk_per_trade: f64,
+    max_portfolio_risk: f64,
+    session_loss_limit: f64,
+    max_consecutive_losses: usize,
+    cooldown: Duration,
+    min_quote_volume: f64,
+    max_spread_percent: f64,
+    obi_confirmation_samples: usize,
 }
 
 impl Config {
@@ -118,6 +160,26 @@ struct Ticker {
 struct Depth {
     bids: Vec<Vec<String>>,
     asks: Vec<Vec<String>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct BookTicker {
+    symbol: String,
+    #[serde(rename = "bidPrice")]
+    bid_price: String,
+    #[serde(rename = "askPrice")]
+    ask_price: String,
+}
+
+fn spread_percent(book: &BookTicker) -> Option<f64> {
+    let bid = book.bid_price.parse::<f64>().ok()?;
+    let ask = book.ask_price.parse::<f64>().ok()?;
+    let mid = (bid + ask) / 2.0;
+    if bid <= 0.0 || ask < bid || mid <= 0.0 {
+        None
+    } else {
+        Some(((ask - bid) / mid) * 100.0)
+    }
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -350,25 +412,36 @@ fn load_history_from_db(
 
 fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> DailyAccounting {
     let mut starting = default_starting;
-    let mut current = default_starting;
+    let mut ledger_pnl = 0.0;
+    let mut date = "unknown".to_string();
     if let Ok(c) = conn.lock() {
         if let Ok(val) = c.query_row(
             "SELECT value FROM kv_store WHERE key='starting_balance'",
             [],
             |row| row.get::<_, String>(0),
         ) {
-            if let Ok(p) = val.parse::<f64>() {
-                starting = p;
+            if let Ok(parsed) = val.parse::<f64>() {
+                starting = parsed;
             }
         }
-        if let Ok(val) = c.query_row(
-            "SELECT value FROM kv_store WHERE key='current_balance'",
-            [],
-            |row| row.get::<_, String>(0),
+        ledger_pnl = c
+            .query_row(
+                "SELECT COALESCE(SUM(pnl_usd), 0.0) FROM closed_trades",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(0.0);
+        date = c
+            .query_row("SELECT date('now')", [], |row| row.get::<_, String>(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+    }
+    let current = starting + ledger_pnl;
+    if let Ok(c) = conn.lock() {
+        if let Err(e) = c.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('current_balance', ?1)",
+            params![current.to_string()],
         ) {
-            if let Ok(p) = val.parse::<f64>() {
-                current = p;
-            }
+            eprintln!("Ledger bakiye uzlaştırması kaydedilemedi: {e}");
         }
     }
     let total_roi = if starting > 0.0 {
@@ -376,14 +449,6 @@ fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> D
     } else {
         0.0
     };
-    let date = conn
-        .lock()
-        .ok()
-        .and_then(|c| {
-            c.query_row("SELECT date('now')", [], |row| row.get::<_, String>(0))
-                .ok()
-        })
-        .unwrap_or_else(|| "unknown".to_string());
     DailyAccounting {
         date,
         starting_balance: starting,
@@ -491,6 +556,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
         }
     };
     let mut symbol_filters: HashMap<String, SymbolFilters> = HashMap::new();
+    let mut obi_samples: HashMap<String, VecDeque<f64>> = HashMap::new();
+    let mut symbol_cooldowns: HashMap<String, Instant> = HashMap::new();
+    let mut consecutive_losses = 0usize;
+    let session_starting_balance = shared_state
+        .lock()
+        .map(|state| state.accounting.current_balance)
+        .unwrap_or(0.0);
     loop {
         if symbol_filters.is_empty() {
             match fetch_symbol_filters(&client, &config) {
@@ -512,6 +584,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
             .and_then(|r| r.json::<Vec<Ticker>>());
         match tickers_result {
             Ok(tickers) => {
+                let book_map: HashMap<String, BookTicker> = client
+                    .get(config.futures_url("fapi/v1/ticker/bookTicker"))
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.json::<Vec<BookTicker>>())
+                    .map(|books| books.into_iter().map(|book| (book.symbol.clone(), book)).collect())
+                    .unwrap_or_default();
                 let mut state = match shared_state.lock() {
                     Ok(s) => s.clone(),
                     Err(_) => {
@@ -521,8 +600,8 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 };
                 let mut newly_closed = Vec::new();
                 let mut still_active = Vec::new();
-                let current_err =
-                    String::from("Sistem Kararlı Çalışıyor (Gelişmiş Break-Even & Trailing Modu)");
+                let mut current_err =
+                    String::from("Sistem Kararlı Çalışıyor (Risk Kontrollü Simülasyon Modu)");
                 let mut batch_realized_pnl = 0.0;
 
                 for mut pos in state.positions {
@@ -621,84 +700,129 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
 
                 state.accounting.current_balance += batch_realized_pnl;
 
-                for t in &tickers {
-                    if t.symbol.ends_with("USDT") {
-                        if let (Ok(change), Ok(vol), Ok(_price)) = (
+                let session_drawdown = if session_starting_balance > 0.0 {
+                    ((session_starting_balance - state.accounting.current_balance)
+                        / session_starting_balance)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
+                let safety_allows_entries = config.entry_enabled
+                    && session_drawdown < config.session_loss_limit
+                    && consecutive_losses < config.max_consecutive_losses;
+                if !safety_allows_entries {
+                    current_err = if !config.entry_enabled {
+                        "Yeni girişler ENTRY_ENABLED ile durduruldu".to_string()
+                    } else if consecutive_losses >= config.max_consecutive_losses {
+                        format!("Ardışık {consecutive_losses} kayıp sonrası yeni girişler kilitlendi")
+                    } else {
+                        format!("Seans zarar limiti aşıldı: %{:.2}", session_drawdown * 100.0)
+                    };
+                }
+
+                if safety_allows_entries {
+                    for t in &tickers {
+                        if !t.symbol.ends_with("USDT") {
+                            continue;
+                        }
+                        let (Ok(change), Ok(vol), Ok(price)) = (
                             t.price_change_percent.parse::<f64>(),
                             t.quote_volume.parse::<f64>(),
                             t.last_price.parse::<f64>(),
-                        ) {
-                            if vol > 1_000_000.0 && change.abs() > 2.0 {
-                                if let Ok(obi) = calculate_obi(&client, &config, &t.symbol) {
-                                    let (should_open, side, lev) = match (change, obi) {
-                                        (c, o) if c > 2.0 && o >= 0.20 => (true, "LONG", 3.0),
-                                        (c, o) if c < -2.0 && o <= -0.20 => (true, "SHORT", 3.0),
-                                        _ => (false, "", 0.0),
-                                    };
-                                    if should_open {
-                                        let already_active =
-                                            still_active.iter().any(|p| p.symbol == t.symbol);
-                                        let committed_margin: f64 =
-                                            still_active.iter().map(|p| p.margin_usdt).sum();
-                                        if !already_active
-                                            && still_active.len() < MAX_POSITIONS
-                                            && (state.accounting.current_balance - committed_margin)
-                                                >= POSITION_MARGIN_USDT
-                                        {
-                                            let price = t.last_price.parse::<f64>().unwrap_or(0.0);
-                                            if price > 0.0 {
-                                                let raw_qty = (POSITION_MARGIN_USDT * lev) / price;
-                                                let Some(filters) = symbol_filters.get(&t.symbol)
-                                                else {
-                                                    continue;
-                                                };
-                                                let Some(stepped_qty) =
-                                                    quantize_quantity(raw_qty, filters)
-                                                else {
-                                                    continue;
-                                                };
-                                                let precision = filters
-                                                    .step_size
-                                                    .to_string()
-                                                    .split('.')
-                                                    .nth(1)
-                                                    .map_or(0, |v| v.trim_end_matches('0').len());
-                                                let qty_str =
-                                                    format!("{:.*}", precision, stepped_qty);
-                                                let (stop_loss, take_profit) = if side == "LONG" {
-                                                    (price * 0.985, price * 1.035)
-                                                } else {
-                                                    (price * 1.015, price * 0.965)
-                                                };
-                                                let current_id = state.next_position_id;
-                                                state.next_position_id += 1;
-                                                still_active.push(ActivePosition {
-                                                    id: current_id,
-                                                    symbol: t.symbol.clone(),
-                                                    side: side.to_string(),
-                                                    entry_price: price,
-                                                    current_price: price,
-                                                    stop_loss,
-                                                    take_profit,
-                                                    best_price: price,
-                                                    peak_pnl_percent: -0.04 * lev,
-                                                    leverage: lev,
-                                                    margin_usdt: POSITION_MARGIN_USDT,
-                                                    lifecycle: PositionLifecycle::PendingOpen,
-                                                    status: format!(
-                                                        "Simüle Emir Gönderildi ({})",
-                                                        side
-                                                    ),
-                                                    pnl_percent: -0.04 * lev,
-                                                    pnl_usd: -(POSITION_MARGIN_USDT * 0.0004 * lev),
-                                                    quantity: qty_str,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        ) else {
+                            continue;
+                        };
+                        if price <= 0.0 || vol < config.min_quote_volume || change.abs() <= 2.0 {
+                            continue;
                         }
+                        let Some(book) = book_map.get(&t.symbol) else { continue; };
+                        let Some(spread) = spread_percent(book) else { continue; };
+                        if spread > config.max_spread_percent {
+                            continue;
+                        }
+                        let Ok(obi) = calculate_obi(&client, &config, &t.symbol) else { continue; };
+                        let samples = obi_samples.entry(t.symbol.clone()).or_default();
+                        samples.push_back(obi);
+                        while samples.len() > config.obi_confirmation_samples {
+                            samples.pop_front();
+                        }
+                        if samples.len() < config.obi_confirmation_samples {
+                            continue;
+                        }
+                        let long_confirmed = change > 2.0 && samples.iter().all(|value| *value >= 0.20);
+                        let short_confirmed = change < -2.0 && samples.iter().all(|value| *value <= -0.20);
+                        let (side, leverage) = if long_confirmed {
+                            ("LONG", 3.0)
+                        } else if short_confirmed {
+                            ("SHORT", 3.0)
+                        } else {
+                            continue;
+                        };
+                        let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
+                        let cooling_down = symbol_cooldowns
+                            .get(&t.symbol)
+                            .is_some_and(|closed_at| closed_at.elapsed() < config.cooldown);
+                        if already_active || cooling_down || still_active.len() >= config.max_positions {
+                            continue;
+                        }
+                        let committed_margin: f64 =
+                            still_active.iter().map(|position| position.margin_usdt).sum();
+                        let free_margin = state.accounting.current_balance - committed_margin;
+                        if free_margin <= 0.0 {
+                            continue;
+                        }
+                        let (stop_loss, take_profit) = if side == "LONG" {
+                            (price * 0.985, price * 1.035)
+                        } else {
+                            (price * 1.015, price * 0.965)
+                        };
+                        let Some(filters) = symbol_filters.get(&t.symbol) else { continue; };
+                        let Some((quantity, margin_usdt, new_risk)) = calculate_position_size(
+                            state.accounting.current_balance,
+                            price,
+                            stop_loss,
+                            leverage,
+                            config.risk_per_trade,
+                            filters,
+                        ) else {
+                            continue;
+                        };
+                        let portfolio_risk: f64 = still_active.iter().map(position_risk).sum();
+                        let max_risk_usd =
+                            state.accounting.current_balance * config.max_portfolio_risk;
+                        if portfolio_risk + new_risk > max_risk_usd || margin_usdt > free_margin {
+                            continue;
+                        }
+                        let precision = filters
+                            .step_size
+                            .to_string()
+                            .split('.')
+                            .nth(1)
+                            .map_or(0, |value| value.trim_end_matches('0').len());
+                        let quantity_text = format!("{:.*}", precision, quantity);
+                        let current_id = state.next_position_id;
+                        state.next_position_id += 1;
+                        still_active.push(ActivePosition {
+                            id: current_id,
+                            symbol: t.symbol.clone(),
+                            side: side.to_string(),
+                            entry_price: price,
+                            current_price: price,
+                            stop_loss,
+                            take_profit,
+                            best_price: price,
+                            peak_pnl_percent: -FEE_RATE_PERCENT * leverage,
+                            leverage,
+                            margin_usdt,
+                            lifecycle: PositionLifecycle::PendingOpen,
+                            status: format!(
+                                "Risk kontrollü simüle emir: {} / risk USD {:.2}",
+                                side, new_risk
+                            ),
+                            pnl_percent: -FEE_RATE_PERCENT * leverage,
+                            pnl_usd: -(margin_usdt * FEE_RATE_PERCENT * leverage / 100.0),
+                            quantity: quantity_text,
+                        });
                     }
                 }
 
@@ -718,6 +842,15 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     }
                     thread::sleep(Duration::from_secs(1));
                     continue;
+                }
+
+                for closed in &newly_closed {
+                    symbol_cooldowns.insert(closed.symbol.clone(), Instant::now());
+                    if closed.pnl_usd < 0.0 {
+                        consecutive_losses += 1;
+                    } else {
+                        consecutive_losses = 0;
+                    }
                 }
 
                 state.positions = still_active;
@@ -748,6 +881,47 @@ fn main() {
     let config = Config {
         base_url: env::var("BINANCE_BASE_URL")
             .unwrap_or_else(|_| "https://testnet.binancefuture.com".into()),
+        entry_enabled: env::var("ENTRY_ENABLED")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+        max_positions: env::var("MAX_POSITIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5),
+        risk_per_trade: env::var("RISK_PER_TRADE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.005),
+        max_portfolio_risk: env::var("MAX_PORTFOLIO_RISK")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.02),
+        session_loss_limit: env::var("SESSION_LOSS_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.02),
+        max_consecutive_losses: env::var("MAX_CONSECUTIVE_LOSSES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3),
+        cooldown: Duration::from_secs(
+            env::var("SYMBOL_COOLDOWN_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3600),
+        ),
+        min_quote_volume: env::var("MIN_QUOTE_VOLUME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20_000_000.0),
+        max_spread_percent: env::var("MAX_SPREAD_PERCENT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.10),
+        obi_confirmation_samples: env::var("OBI_CONFIRMATION_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3),
     };
     let db = match init_db() {
         Ok(db) => db,
