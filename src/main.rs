@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn display_numbers_use_bounded_precision() {
-        assert_eq!(format_price(12_345.6789), "12345.68");
+        assert_eq!(format_price(12_345.678_9), "12345.68");
         assert_eq!(format_price(12.345678), "12.3457");
         assert_eq!(format_price(0.123456789), "0.123457");
         assert_eq!(format_price(0.00123456789), "0.00123457");
