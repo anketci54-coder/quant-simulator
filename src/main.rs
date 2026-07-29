@@ -181,7 +181,9 @@ fn format_price(value: f64) -> String {
     } else {
         8
     };
-    format!("{value:.precision$}")
+    let scale = 10_f64.powi(precision as i32);
+    let rounded = (value * scale).round() / scale;
+    format!("{rounded:.precision$}")
 }
 
 fn format_quantity(value: &str) -> String {
@@ -189,7 +191,8 @@ fn format_quantity(value: &str) -> String {
         .parse::<f64>()
         .map(|parsed| {
             if parsed.abs() >= 1_000.0 {
-                format!("{parsed:.2}")
+                let rounded = (parsed * 100.0).round() / 100.0;
+                format!("{rounded:.2}")
             } else {
                 let trimmed = format!("{parsed:.8}")
                     .trim_end_matches('0')
