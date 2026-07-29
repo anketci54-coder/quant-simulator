@@ -979,7 +979,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
     }
 }
 
-
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -990,18 +989,39 @@ fn escape_html(value: &str) -> String {
 }
 
 fn render_dashboard(state: &AppState) -> String {
-    let roi_class = if state.accounting.total_roi >= 0.0 { "positive" } else { "negative" };
+    let roi_class = if state.accounting.total_roi >= 0.0 {
+        "positive"
+    } else {
+        "negative"
+    };
     let win_rate = if state.accounting.closed_trades_count > 0 {
-        state.accounting.successful_trades as f64 / state.accounting.closed_trades_count as f64 * 100.0
-    } else { 0.0 };
-    let used_margin: f64 = state.positions.iter().map(|position| position.margin_usdt).sum();
-    let open_pnl: f64 = state.positions.iter().map(|position| position.pnl_usd).sum();
-    let status_text = if state.last_error.contains("ENTRY_ENABLED") { "Yeni işlemler kapalı" } else { &state.last_error };
+        state.accounting.successful_trades as f64 / state.accounting.closed_trades_count as f64
+            * 100.0
+    } else {
+        0.0
+    };
+    let used_margin: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.margin_usdt)
+        .sum();
+    let open_pnl: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.pnl_usd)
+        .sum();
+    let status_text = if state.last_error.contains("ENTRY_ENABLED") {
+        "Yeni işlemler kapalı"
+    } else {
+        &state.last_error
+    };
     let status_class = if state.last_error.contains("Hata") {
         "status danger"
     } else if state.last_error.contains("ENTRY_ENABLED") {
         "status warning"
-    } else { "status healthy" };
+    } else {
+        "status healthy"
+    };
 
     let mut html = format!(
         r#"<!doctype html>
@@ -1041,16 +1061,32 @@ table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:10px;t
 <div class="stat"><span>Başarı Oranı</span><strong>{win_rate:.1}%</strong></div>
 <div class="stat"><span>Profit Factor</span><strong>{pf:.2}</strong></div></section>
 <div class="section-head"><h2>Açık Pozisyonlar</h2><span>{position_count} pozisyon</span></div><section class="position-grid">"#,
-        status_class=status_class,status=escape_html(status_text),balance=state.accounting.current_balance,
-        roi_class=roi_class,roi=state.accounting.total_roi,open_class=if open_pnl>=0.0{"positive"}else{"negative"},
-        open_pnl=open_pnl,used_margin=used_margin,win_rate=win_rate,pf=state.stats.profit_factor,position_count=state.positions.len()
+        status_class = status_class,
+        status = escape_html(status_text),
+        balance = state.accounting.current_balance,
+        roi_class = roi_class,
+        roi = state.accounting.total_roi,
+        open_class = if open_pnl >= 0.0 {
+            "positive"
+        } else {
+            "negative"
+        },
+        open_pnl = open_pnl,
+        used_margin = used_margin,
+        win_rate = win_rate,
+        pf = state.stats.profit_factor,
+        position_count = state.positions.len()
     );
 
     if state.positions.is_empty() {
         html.push_str(r#"<div class="empty">Henüz açık pozisyon yok.</div>"#);
     } else {
         for position in &state.positions {
-            let side_class = if position.side == "LONG" { "long" } else { "short" };
+            let side_class = if position.side == "LONG" {
+                "long"
+            } else {
+                "short"
+            };
             let notional = position.margin_usdt * position.leverage;
             html.push_str(&format!(
                 r#"<article class="position {side_class}"><div class="position-top">
@@ -1075,8 +1111,16 @@ table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:10px;t
         html.push_str(r#"<tr><td colspan="8" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
     } else {
         for trade in &state.history {
-            let side_class=if trade.side=="LONG"{"long"}else{"short"};
-            let pnl_class=if trade.pnl_usd>=0.0{"positive"}else{"negative"};
+            let side_class = if trade.side == "LONG" {
+                "long"
+            } else {
+                "short"
+            };
+            let pnl_class = if trade.pnl_usd >= 0.0 {
+                "positive"
+            } else {
+                "negative"
+            };
             html.push_str(&format!(
                 r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{status}</td><td class="{pnl_class}">{pnl_percent:+.2}%</td><td class="{pnl_class}">&#36;{pnl_usd:+.2}</td></tr>"#,
                 id=trade.id,symbol=escape_html(&trade.symbol),side_class=side_class,side=escape_html(&trade.side),
