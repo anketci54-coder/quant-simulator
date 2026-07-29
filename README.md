@@ -41,7 +41,8 @@ Panel varsayılan olarak yalnızca `127.0.0.1:8080` üzerinde dinler.
 - Başlangıçta bakiye `closed_trades` ledger toplamından otomatik uzlaştırılır
 - Peak PnL tabanlı break-even ve trailing stop
 - SQLite WAL ve atomik batch snapshot
-- Varsayılan başlangıç bakiyesi: 1000 USDT
+- Varsayılan başlangıç bakiyesi: 10.000 USDT (`INITIAL_BALANCE_USDT`)
+- Panel fiyatları büyüklüğe göre 2/4/6/8 ondalık, PnL ve bakiye 2 ondalık gösterilir
 
 ## Bilinen canlı-geçiş eksikleri
 
