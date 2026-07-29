@@ -118,7 +118,6 @@ enum PositionLifecycle {
     PendingOpen,
     Open,
     Closed,
-
 }
 
 #[derive(Clone)]
@@ -239,7 +238,6 @@ fn format_quantity(value: &str) -> String {
             if parsed.abs() >= 1_000.0 {
                 let rounded = (parsed * 100.0).round() / 100.0;
                 format_tr_number(rounded, 2, false)
-
             } else {
                 let trimmed = format_tr_number(parsed, 8, false)
                     .trim_end_matches('0')
@@ -359,7 +357,6 @@ fn get_max_closed_id(conn: &Mutex<Connection>) -> usize {
         0
     }
 }
-
 
 fn get_max_active_id(conn: &Mutex<Connection>) -> usize {
     if let Ok(c) = conn.lock() {
@@ -481,7 +478,6 @@ fn load_history_from_db(
 
     let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
     let iter = stmt
-
         .query_map([], |row| {
             Ok(ClosedPosition {
                 id: row.get::<_, i64>(0)? as usize,
@@ -602,7 +598,6 @@ fn fetch_symbol_filters(
             } = filter
             {
                 if let (Ok(min_qty), Ok(max_qty), Ok(step_size)) = (
-
                     min_qty.parse::<f64>(),
                     max_qty.parse::<f64>(),
                     step_size.parse::<f64>(),
@@ -723,7 +718,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         thread::sleep(Duration::from_secs(1));
                         continue;
                     }
-
                 };
                 let mut newly_closed = Vec::new();
                 let mut still_active = Vec::new();
@@ -844,7 +838,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     } else if consecutive_losses >= config.max_consecutive_losses {
                         format!(
                             "Ardışık {consecutive_losses} kayıp sonrası yeni girişler kilitlendi"
-
                         )
                     } else {
                         format!(
@@ -965,7 +958,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         let max_risk_usd =
                             state.accounting.current_balance * config.max_portfolio_risk;
                         if portfolio_risk + new_risk > max_risk_usd || margin_usdt > free_margin {
-
                             continue;
                         }
                         let precision = filters
@@ -1086,7 +1078,6 @@ fn render_dashboard(state: &AppState) -> String {
         .map(|position| position.pnl_usd)
         .sum();
     let status_text = if state.last_error.contains("ENTRY_ENABLED") {
-
         "Yeni işlemler kapalı"
     } else {
         &state.last_error
@@ -1207,7 +1198,6 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
             let side_class = if trade.side == "LONG" {
                 "long"
             } else {
-
                 "short"
             };
             let pnl_class = if trade.pnl_usd >= 0.0 {
