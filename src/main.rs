@@ -8,7 +8,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tiny_http::{Response, Server};
 
-const MAX_POSITION_MARGIN_USDT: f64 = 100.0;
 const FEE_RATE_PERCENT: f64 = 0.04;
 const BREAKEVEN_BUFFER_RATE: f64 = 0.001;
 
@@ -60,6 +59,19 @@ fn calculate_pnl_percent(side: &str, entry: f64, current: f64, leverage: f64) ->
     Some((raw_diff * leverage * 100.0) - (FEE_RATE_PERCENT * leverage * 2.0))
 }
 
+fn calculate_trade_pnl(side: &str, entry: f64, exit: f64, quantity: f64) -> Option<f64> {
+    if entry <= 0.0 || exit <= 0.0 || quantity <= 0.0 {
+        return None;
+    }
+    let gross = match side {
+        "LONG" => (exit - entry) * quantity,
+        "SHORT" => (entry - exit) * quantity,
+        _ => return None,
+    };
+    let fees = (entry + exit) * quantity * (FEE_RATE_PERCENT / 100.0);
+    Some(gross - fees)
+}
+
 fn break_even_stop(side: &str, entry: f64) -> Option<f64> {
     match side {
         "LONG" => Some(entry * (1.0 + BREAKEVEN_BUFFER_RATE)),
@@ -74,17 +86,24 @@ fn calculate_position_size(
     stop: f64,
     leverage: f64,
     risk_fraction: f64,
+    max_allocation_fraction: f64,
     filters: &SymbolFilters,
 ) -> Option<(f64, f64, f64)> {
-    if balance <= 0.0 || entry <= 0.0 || leverage <= 0.0 || !(0.0..=1.0).contains(&risk_fraction) {
+    if balance <= 0.0
+        || entry <= 0.0
+        || leverage <= 0.0
+        || !(0.0..=1.0).contains(&risk_fraction)
+        || !(0.0..=1.0).contains(&max_allocation_fraction)
+    {
         return None;
     }
     let stop_distance = (entry - stop).abs();
+
     if stop_distance <= 0.0 {
         return None;
     }
     let risk_qty = (balance * risk_fraction) / stop_distance;
-    let margin_capped_qty = (MAX_POSITION_MARGIN_USDT * leverage) / entry;
+    let margin_capped_qty = (balance * max_allocation_fraction * leverage) / entry;
     let raw_qty = risk_qty.min(margin_capped_qty);
     let qty = quantize_quantity(raw_qty, filters)?;
     let margin = (qty * entry) / leverage;
@@ -113,6 +132,26 @@ fn quantize_quantity(raw_qty: f64, filters: &SymbolFilters) -> Option<f64> {
     }
 }
 
+fn partial_quantity(
+    initial_quantity: f64,
+    remaining_quantity: f64,
+    fraction: f64,
+    filters: &SymbolFilters,
+) -> Option<f64> {
+    let requested = (initial_quantity * fraction).min(remaining_quantity);
+    quantize_quantity(requested, filters)
+}
+
+fn exchange_quantity_text(quantity: f64, filters: &SymbolFilters) -> String {
+    let precision = filters
+        .step_size
+        .to_string()
+        .split('.')
+        .nth(1)
+        .map_or(0, |value| value.trim_end_matches('0').len());
+    format!("{quantity:.precision$}")
+}
+
 #[derive(Clone, Serialize, Debug, PartialEq)]
 enum PositionLifecycle {
     PendingOpen,
@@ -127,6 +166,7 @@ struct Config {
     max_positions: usize,
     max_same_side_positions: usize,
     max_signal_candidates: usize,
+    max_trade_allocation: f64,
     risk_per_trade: f64,
     max_portfolio_risk: f64,
     session_loss_limit: f64,
@@ -282,6 +322,12 @@ struct ActivePosition {
     pnl_percent: f64,
     pnl_usd: f64,
     quantity: String,
+    initial_quantity: String,
+    tp1_price: f64,
+    tp2_price: f64,
+    tp_stage: u8,
+    realized_pnl_usd: f64,
+    atr: f64,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -294,6 +340,16 @@ struct ClosedPosition {
     status: String,
     pnl_percent: f64,
     pnl_usd: f64,
+    max_pnl_percent: f64,
+    exit_stage: String,
+}
+
+#[derive(Clone, Debug)]
+struct FastIndicators {
+    ema_fast: f64,
+    ema_slow: f64,
+    rsi: f64,
+    atr: f64,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -331,10 +387,22 @@ fn init_db() -> Result<Connection, String> {
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
     )
     .map_err(|e| format!("SQLite PRAGMA ayarlanamadı: {e}"))?;
-    conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", [])
+    conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, max_pnl_percent REAL NOT NULL DEFAULT 0, exit_stage TEXT NOT NULL DEFAULT 'LEGACY')", [])
         .map_err(|e| format!("closed_trades şeması oluşturulamadı: {e}"))?;
-    conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", [])
+    conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL, initial_quantity TEXT NOT NULL DEFAULT '0', tp1_price REAL NOT NULL DEFAULT 0, tp2_price REAL NOT NULL DEFAULT 0, tp_stage INTEGER NOT NULL DEFAULT 0, realized_pnl_usd REAL NOT NULL DEFAULT 0, atr REAL NOT NULL DEFAULT 0)", [])
         .map_err(|e| format!("active_positions şeması oluşturulamadı: {e}"))?;
+    for migration in [
+        "ALTER TABLE closed_trades ADD COLUMN max_pnl_percent REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE closed_trades ADD COLUMN exit_stage TEXT NOT NULL DEFAULT 'LEGACY'",
+        "ALTER TABLE active_positions ADD COLUMN initial_quantity TEXT NOT NULL DEFAULT '0'",
+        "ALTER TABLE active_positions ADD COLUMN tp1_price REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN tp2_price REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN tp_stage INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN realized_pnl_usd REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN atr REAL NOT NULL DEFAULT 0",
+    ] {
+        let _ = conn.execute(migration, []);
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         [],
@@ -373,6 +441,63 @@ fn get_max_active_id(conn: &Mutex<Connection>) -> usize {
     }
 }
 
+fn load_consecutive_losses(conn: &Mutex<Connection>) -> usize {
+    let Ok(c) = conn.lock() else {
+        return 0;
+    };
+    let Ok(mut statement) =
+        c.prepare("SELECT pnl_usd FROM closed_trades ORDER BY id DESC LIMIT 20")
+    else {
+        return 0;
+    };
+    let Ok(rows) = statement.query_map([], |row| row.get::<_, f64>(0)) else {
+        return 0;
+    };
+    rows.filter_map(Result::ok)
+        .take_while(|pnl| *pnl < 0.0)
+        .count()
+}
+
+fn load_or_create_daily_starting_balance(conn: &Mutex<Connection>, current_balance: f64) -> f64 {
+    let Ok(c) = conn.lock() else {
+        return current_balance;
+    };
+    let today = c
+        .query_row("SELECT date('now')", [], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let stored_date = c
+        .query_row(
+            "SELECT value FROM kv_store WHERE key='risk_session_date'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    let stored_balance = c
+        .query_row(
+            "SELECT value FROM kv_store WHERE key='risk_session_starting_balance'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok());
+    if stored_date.as_deref() == Some(today.as_str()) {
+        return stored_balance.unwrap_or(current_balance);
+    }
+    if let Err(error) = c.execute(
+        "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('risk_session_date', ?1)",
+        params![today],
+    ) {
+        eprintln!("Günlük risk tarihi kaydedilemedi: {error}");
+    }
+    if let Err(error) = c.execute(
+        "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('risk_session_starting_balance', ?1)",
+        params![current_balance.to_string()],
+    ) {
+        eprintln!("Günlük başlangıç bakiyesi kaydedilemedi: {error}");
+    }
+    current_balance
+}
+
 fn atomic_batch_save(
     conn: &Mutex<Connection>,
     closed_list: &[ClosedPosition],
@@ -384,8 +509,8 @@ fn atomic_batch_save(
 
     for h in closed_list {
         tx.execute(
-            "INSERT OR IGNORE INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd],
+            "INSERT OR IGNORE INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd, h.max_pnl_percent, h.exit_stage.clone()],
         ).map_err(|e| e.to_string())?;
     }
 
@@ -398,8 +523,8 @@ fn atomic_batch_save(
             PositionLifecycle::Closed => "Closed",
         };
         tx.execute(
-            "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone()],
+            "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone(), p.initial_quantity.clone(), p.tp1_price, p.tp2_price, p.tp_stage as i64, p.realized_pnl_usd, p.atr],
         ).map_err(|e| e.to_string())?;
     }
 
@@ -421,7 +546,7 @@ fn atomic_batch_save(
 fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActivePosition>, String> {
     let mut positions = Vec::new();
     let c = conn.lock().map_err(|e| e.to_string())?;
-    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity FROM active_positions").map_err(|e| e.to_string())?;
+    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr FROM active_positions").map_err(|e| e.to_string())?;
     let iter = stmt
         .query_map([], |row| {
             let lc_str: String = row.get(11)?;
@@ -448,6 +573,19 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
                 pnl_percent: row.get(13)?,
                 pnl_usd: row.get(14)?,
                 quantity: row.get(15)?,
+                initial_quantity: {
+                    let value: String = row.get(16)?;
+                    if value == "0" {
+                        row.get(15)?
+                    } else {
+                        value
+                    }
+                },
+                tp1_price: row.get(17)?,
+                tp2_price: row.get(18)?,
+                tp_stage: row.get::<_, i64>(19)? as u8,
+                realized_pnl_usd: row.get(20)?,
+                atr: row.get(21)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -476,7 +614,7 @@ fn load_history_from_db(
         )
         .unwrap_or(0) as usize;
 
-    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
+    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
     let iter = stmt
         .query_map([], |row| {
             Ok(ClosedPosition {
@@ -488,6 +626,8 @@ fn load_history_from_db(
                 status: row.get(5)?,
                 pnl_percent: row.get(6)?,
                 pnl_usd: row.get(7)?,
+                max_pnl_percent: row.get(8)?,
+                exit_stage: row.get(9)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -657,6 +797,99 @@ fn calculate_obi(
     }
 }
 
+fn ema(values: &[f64], period: usize) -> Option<f64> {
+    let first = *values.first()?;
+    let multiplier = 2.0 / (period as f64 + 1.0);
+    Some(values.iter().skip(1).fold(first, |current, value| {
+        (value - current) * multiplier + current
+    }))
+}
+
+fn calculate_fast_indicators(
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+) -> Option<FastIndicators> {
+    if closes.len() < 22 || highs.len() != closes.len() || lows.len() != closes.len() {
+        return None;
+    }
+    let ema_fast = ema(closes, 8)?;
+    let ema_slow = ema(closes, 21)?;
+
+    let changes: Vec<f64> = closes
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect();
+    let rsi_period = changes.len().min(7);
+    let recent_changes = &changes[changes.len() - rsi_period..];
+    let gains: f64 = recent_changes.iter().map(|change| change.max(0.0)).sum();
+    let losses: f64 = recent_changes.iter().map(|change| (-change).max(0.0)).sum();
+    let rsi = if losses <= f64::EPSILON {
+        100.0
+    } else {
+        100.0 - (100.0 / (1.0 + gains / losses))
+    };
+
+    let true_ranges: Vec<f64> = (1..closes.len())
+        .map(|index| {
+            let high_low = highs[index] - lows[index];
+            let high_close = (highs[index] - closes[index - 1]).abs();
+            let low_close = (lows[index] - closes[index - 1]).abs();
+            high_low.max(high_close).max(low_close)
+        })
+        .collect();
+    let atr_period = true_ranges.len().min(14);
+    let atr = true_ranges[true_ranges.len() - atr_period..]
+        .iter()
+        .sum::<f64>()
+        / atr_period as f64;
+    if atr <= 0.0 || !atr.is_finite() {
+        return None;
+    }
+    Some(FastIndicators {
+        ema_fast,
+        ema_slow,
+        rsi,
+        atr,
+    })
+}
+
+fn fetch_fast_indicators(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    symbol: &str,
+) -> Result<FastIndicators, String> {
+    let url = format!(
+        "{}?symbol={symbol}&interval=1m&limit=60",
+        config.futures_url("fapi/v1/klines")
+    );
+    let rows = client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| format!("kline request failed for {symbol}: {error}"))?
+        .json::<Vec<Vec<serde_json::Value>>>()
+        .map_err(|error| format!("kline parse failed for {symbol}: {error}"))?;
+    let mut highs = Vec::with_capacity(rows.len());
+    let mut lows = Vec::with_capacity(rows.len());
+    let mut closes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let parse = |index: usize| {
+            row.get(index)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<f64>().ok())
+        };
+        let (Some(high), Some(low), Some(close)) = (parse(2), parse(3), parse(4)) else {
+            continue;
+        };
+        highs.push(high);
+        lows.push(low);
+        closes.push(close);
+    }
+    calculate_fast_indicators(&highs, &lows, &closes)
+        .ok_or_else(|| format!("insufficient indicator data for {symbol}"))
+}
+
 fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Connection>>) {
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
@@ -674,11 +907,12 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
     let mut symbol_filters: HashMap<String, SymbolFilters> = HashMap::new();
     let mut obi_samples: HashMap<String, VecDeque<f64>> = HashMap::new();
     let mut symbol_cooldowns: HashMap<String, Instant> = HashMap::new();
-    let mut consecutive_losses = 0usize;
-    let session_starting_balance = shared_state
+    let mut consecutive_losses = load_consecutive_losses(&db_conn);
+    let current_balance = shared_state
         .lock()
         .map(|state| state.accounting.current_balance)
         .unwrap_or(0.0);
+    let session_starting_balance = load_or_create_daily_starting_balance(&db_conn, current_balance);
     loop {
         if symbol_filters.is_empty() {
             match fetch_symbol_filters(&client, &config) {
@@ -758,47 +992,152 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             pos.pnl_percent = pnl_percent;
                             pos.peak_pnl_percent = pos.peak_pnl_percent.max(pos.pnl_percent);
 
-                            if pos.peak_pnl_percent >= 2.5 && pos.peak_pnl_percent < 5.0 {
-                                if let Some(be_stop) = break_even_stop(&pos.side, pos.entry_price) {
-                                    if (pos.side == "LONG" && pos.stop_loss < be_stop)
-                                        || (pos.side == "SHORT" && pos.stop_loss > be_stop)
-                                    {
-                                        pos.stop_loss = be_stop;
+                            let mut remaining_quantity =
+                                pos.quantity.parse::<f64>().unwrap_or_default();
+                            let initial_quantity = pos
+                                .initial_quantity
+                                .parse::<f64>()
+                                .unwrap_or(remaining_quantity);
+                            if pos.tp1_price <= 0.0 || pos.tp2_price <= 0.0 {
+                                let risk_distance = (pos.entry_price - pos.stop_loss).abs();
+                                pos.atr = (risk_distance / 1.8).max(pos.entry_price * 0.001);
+                                if pos.side == "LONG" {
+                                    pos.tp1_price = pos.entry_price + risk_distance;
+                                    pos.tp2_price = pos.entry_price + risk_distance * 2.0;
+                                    pos.take_profit = pos.entry_price + risk_distance * 4.0;
+                                } else {
+                                    pos.tp1_price = pos.entry_price - risk_distance;
+                                    pos.tp2_price = pos.entry_price - risk_distance * 2.0;
+                                    pos.take_profit = pos.entry_price - risk_distance * 4.0;
+                                }
+                            }
+
+                            if let Some(filters) = symbol_filters.get(&pos.symbol) {
+                                let tp1_hit = (pos.side == "LONG" && curr_price >= pos.tp1_price)
+                                    || (pos.side == "SHORT" && curr_price <= pos.tp1_price);
+                                if pos.tp_stage == 0 && tp1_hit {
+                                    if let Some(close_quantity) = partial_quantity(
+                                        initial_quantity,
+                                        remaining_quantity,
+                                        0.30,
+                                        filters,
+                                    ) {
+                                        if let Some(partial_pnl) = calculate_trade_pnl(
+                                            &pos.side,
+                                            pos.entry_price,
+                                            curr_price,
+                                            close_quantity,
+                                        ) {
+                                            pos.realized_pnl_usd += partial_pnl;
+                                            remaining_quantity -= close_quantity;
+                                            pos.quantity = exchange_quantity_text(
+                                                remaining_quantity.max(0.0),
+                                                filters,
+                                            );
+                                            pos.tp_stage = 1;
+                                            pos.status = "TP1: %30 kâr realize edildi".to_string();
+                                            if let Some(stop) =
+                                                break_even_stop(&pos.side, pos.entry_price)
+                                            {
+                                                pos.stop_loss = stop;
+                                            }
+                                        }
                                     }
                                 }
-                            } else if pos.peak_pnl_percent >= 5.0 {
-                                if pos.side == "LONG" {
-                                    let trailed_sl = pos.best_price * 0.992;
-                                    if trailed_sl > pos.stop_loss {
-                                        pos.stop_loss = trailed_sl;
-                                    }
-                                } else {
-                                    let trailed_sl = pos.best_price * 1.008;
-                                    if trailed_sl < pos.stop_loss {
-                                        pos.stop_loss = trailed_sl;
+
+                                let tp2_hit = (pos.side == "LONG" && curr_price >= pos.tp2_price)
+                                    || (pos.side == "SHORT" && curr_price <= pos.tp2_price);
+                                if pos.tp_stage == 1 && tp2_hit {
+                                    if let Some(close_quantity) = partial_quantity(
+                                        initial_quantity,
+                                        remaining_quantity,
+                                        0.30,
+                                        filters,
+                                    ) {
+                                        if let Some(partial_pnl) = calculate_trade_pnl(
+                                            &pos.side,
+                                            pos.entry_price,
+                                            curr_price,
+                                            close_quantity,
+                                        ) {
+                                            pos.realized_pnl_usd += partial_pnl;
+                                            remaining_quantity -= close_quantity;
+                                            pos.quantity = exchange_quantity_text(
+                                                remaining_quantity.max(0.0),
+                                                filters,
+                                            );
+                                            pos.tp_stage = 2;
+                                            pos.status =
+                                                "TP2: toplam %60 kâr realize edildi".to_string();
+                                            pos.stop_loss = pos.tp1_price;
+                                        }
                                     }
                                 }
                             }
 
-                            pos.pnl_usd = pos.margin_usdt * (pos.pnl_percent / 100.0);
+                            if pos.tp_stage >= 2 {
+                                let trail_distance = (pos.atr * 2.5).max(pos.entry_price * 0.004);
+                                if pos.side == "LONG" {
+                                    let trailed_stop = pos.best_price - trail_distance;
+                                    if trailed_stop > pos.stop_loss {
+                                        pos.stop_loss = trailed_stop;
+                                    }
+                                } else {
+                                    let trailed_stop = pos.best_price + trail_distance;
+                                    if trailed_stop < pos.stop_loss {
+                                        pos.stop_loss = trailed_stop;
+                                    }
+                                }
+                            }
+
+                            remaining_quantity = pos.quantity.parse::<f64>().unwrap_or_default();
+                            let remaining_pnl = calculate_trade_pnl(
+                                &pos.side,
+                                pos.entry_price,
+                                curr_price,
+                                remaining_quantity,
+                            )
+                            .unwrap_or_default();
+                            pos.margin_usdt = remaining_quantity * pos.entry_price / pos.leverage;
+                            pos.pnl_usd = pos.realized_pnl_usd + remaining_pnl;
                             let mut close_reason = None;
                             if pos.side == "LONG" {
                                 if curr_price <= pos.stop_loss {
-                                    close_reason = Some("SL / Break-Even Hit".to_string());
-                                } else if curr_price >= pos.take_profit {
-                                    close_reason = Some("TP Hit".to_string());
+                                    close_reason = Some(if pos.tp_stage >= 2 {
+                                        "TP3 Trend Stop".to_string()
+                                    } else if pos.tp_stage == 1 {
+                                        "TP1 Sonrası Stop".to_string()
+                                    } else {
+                                        "Başlangıç Stop".to_string()
+                                    });
                                 }
                             } else {
                                 if curr_price >= pos.stop_loss {
-                                    close_reason = Some("SL / Break-Even Hit".to_string());
-                                } else if curr_price <= pos.take_profit {
-                                    close_reason = Some("TP Hit".to_string());
+                                    close_reason = Some(if pos.tp_stage >= 2 {
+                                        "TP3 Trend Stop".to_string()
+                                    } else if pos.tp_stage == 1 {
+                                        "TP1 Sonrası Stop".to_string()
+                                    } else {
+                                        "Başlangıç Stop".to_string()
+                                    });
                                 }
                             }
 
                             if let Some(reason) = close_reason {
                                 pos.lifecycle = PositionLifecycle::Closed;
                                 batch_realized_pnl += pos.pnl_usd;
+                                let initial_margin =
+                                    initial_quantity * pos.entry_price / pos.leverage;
+                                let total_pnl_percent = if initial_margin > 0.0 {
+                                    pos.pnl_usd / initial_margin * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let exit_stage = match pos.tp_stage {
+                                    0 => "SL",
+                                    1 => "TP1",
+                                    _ => "TP3",
+                                };
                                 newly_closed.push(ClosedPosition {
                                     id: pos.id,
                                     symbol: pos.symbol.clone(),
@@ -806,8 +1145,10 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                     entry_price: pos.entry_price,
                                     exit_price: curr_price,
                                     status: reason,
-                                    pnl_percent: pos.pnl_percent,
+                                    pnl_percent: total_pnl_percent,
                                     pnl_usd: pos.pnl_usd,
+                                    max_pnl_percent: pos.peak_pnl_percent,
+                                    exit_stage: exit_stage.to_string(),
                                 });
                             } else {
                                 still_active.push(pos);
@@ -869,7 +1210,39 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     });
                     candidates.truncate(config.max_signal_candidates);
 
-                    for t in candidates {
+                    let market_signals = thread::scope(|scope| {
+                        let http_client = &client;
+                        let engine_config = &config;
+                        let handles: Vec<_> = candidates
+                            .into_iter()
+                            .filter(|ticker| {
+                                book_map
+                                    .get(&ticker.symbol)
+                                    .and_then(spread_percent)
+                                    .is_some_and(|spread| spread <= config.max_spread_percent)
+                            })
+                            .map(|ticker| {
+                                scope.spawn(move || {
+                                    let obi =
+                                        calculate_obi(http_client, engine_config, &ticker.symbol)
+                                            .ok()?;
+                                    let indicators = fetch_fast_indicators(
+                                        http_client,
+                                        engine_config,
+                                        &ticker.symbol,
+                                    )
+                                    .ok()?;
+                                    Some((ticker.clone(), obi, indicators))
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .filter_map(|handle| handle.join().ok().flatten())
+                            .collect::<Vec<_>>()
+                    });
+
+                    for (t, obi, indicators) in market_signals {
                         let (Ok(change), Ok(vol), Ok(price)) = (
                             t.price_change_percent.parse::<f64>(),
                             t.quote_volume.parse::<f64>(),
@@ -880,18 +1253,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if price <= 0.0 || vol < config.min_quote_volume || change.abs() <= 2.0 {
                             continue;
                         }
-                        let Some(book) = book_map.get(&t.symbol) else {
-                            continue;
-                        };
-                        let Some(spread) = spread_percent(book) else {
-                            continue;
-                        };
-                        if spread > config.max_spread_percent {
-                            continue;
-                        }
-                        let Ok(obi) = calculate_obi(&client, &config, &t.symbol) else {
-                            continue;
-                        };
                         let samples = obi_samples.entry(t.symbol.clone()).or_default();
                         samples.push_back(obi);
                         while samples.len() > config.obi_confirmation_samples {
@@ -900,10 +1261,16 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if samples.len() < config.obi_confirmation_samples {
                             continue;
                         }
-                        let long_confirmed =
-                            change > 2.0 && samples.iter().all(|value| *value >= 0.20);
-                        let short_confirmed =
-                            change < -2.0 && samples.iter().all(|value| *value <= -0.20);
+                        let normalized_trend =
+                            (indicators.ema_fast - indicators.ema_slow) / indicators.atr;
+                        let long_confirmed = change > 2.0
+                            && samples.iter().all(|value| *value >= 0.20)
+                            && normalized_trend >= 0.05
+                            && (52.0..=75.0).contains(&indicators.rsi);
+                        let short_confirmed = change < -2.0
+                            && samples.iter().all(|value| *value <= -0.20)
+                            && normalized_trend <= -0.05
+                            && (25.0..=48.0).contains(&indicators.rsi);
                         let (side, leverage) = if long_confirmed {
                             ("LONG", 3.0)
                         } else if short_confirmed {
@@ -925,6 +1292,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             .iter()
                             .filter(|position| position.side == side)
                             .count();
+
                         if same_side_count >= config.max_same_side_positions {
                             continue;
                         }
@@ -936,10 +1304,22 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if free_margin <= 0.0 {
                             continue;
                         }
-                        let (stop_loss, take_profit) = if side == "LONG" {
-                            (price * 0.985, price * 1.035)
+                        let stop_distance =
+                            (indicators.atr * 1.8).clamp(price * 0.006, price * 0.03);
+                        let (stop_loss, tp1_price, tp2_price, take_profit) = if side == "LONG" {
+                            (
+                                price - stop_distance,
+                                price + stop_distance,
+                                price + stop_distance * 2.0,
+                                price + stop_distance * 4.0,
+                            )
                         } else {
-                            (price * 1.015, price * 0.965)
+                            (
+                                price + stop_distance,
+                                price - stop_distance,
+                                price - stop_distance * 2.0,
+                                price - stop_distance * 4.0,
+                            )
                         };
                         let Some(filters) = symbol_filters.get(&t.symbol) else {
                             continue;
@@ -950,6 +1330,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             stop_loss,
                             leverage,
                             config.risk_per_trade,
+                            config.max_trade_allocation,
                             filters,
                         ) else {
                             continue;
@@ -960,13 +1341,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if portfolio_risk + new_risk > max_risk_usd || margin_usdt > free_margin {
                             continue;
                         }
-                        let precision = filters
-                            .step_size
-                            .to_string()
-                            .split('.')
-                            .nth(1)
-                            .map_or(0, |value| value.trim_end_matches('0').len());
-                        let quantity_text = format!("{:.*}", precision, quantity);
+                        let quantity_text = exchange_quantity_text(quantity, filters);
                         let current_id = state.next_position_id;
                         state.next_position_id += 1;
                         still_active.push(ActivePosition {
@@ -988,7 +1363,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             ),
                             pnl_percent: -FEE_RATE_PERCENT * leverage,
                             pnl_usd: -(margin_usdt * FEE_RATE_PERCENT * leverage / 100.0),
-                            quantity: quantity_text,
+                            quantity: quantity_text.clone(),
+                            initial_quantity: quantity_text,
+                            tp1_price,
+                            tp2_price,
+                            tp_stage: 0,
+                            realized_pnl_usd: 0.0,
+                            atr: indicators.atr,
                         });
                     }
                 }
@@ -1112,6 +1493,7 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
 .status{{display:flex;align-items:center;gap:9px;padding:11px 14px;border:1px solid #ffffff12;background:#0b111bd9;border-radius:11px;color:#9eabc0;font-size:12px;box-shadow:inset 0 1px #ffffff08,0 8px 20px #0005}}
 .status:before{{content:"";width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green),0 0 18px var(--green)}}.status.warning:before{{background:var(--gold);box-shadow:0 0 8px var(--gold),0 0 18px var(--gold)}}.status.danger:before{{background:var(--red);box-shadow:0 0 8px var(--red),0 0 18px var(--red)}}
 .stats{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:14px;margin-bottom:30px}}.stat{{position:relative;overflow:hidden;background:linear-gradient(145deg,#192231e8,#0d131de8);border:1px solid #ffffff13;border-radius:16px;padding:17px 16px 18px;box-shadow:0 16px 32px #0007,inset 0 1px #ffffff10;transform:translateZ(0);transition:.25s ease}}
+
 .stat:before{{content:"";position:absolute;inset:0;background:linear-gradient(115deg,#ffffff0d,transparent 34%);pointer-events:none}}.stat:after{{content:"";position:absolute;left:15px;right:15px;bottom:0;height:2px;background:linear-gradient(90deg,transparent,var(--blue),transparent);opacity:.55}}.stat:hover{{transform:translateY(-5px) rotateX(3deg);border-color:#5ba8ff55;box-shadow:0 24px 42px #0009,0 0 22px #5ba8ff18,inset 0 1px #ffffff18}}
 .stat span{{display:block;color:#8696ad;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}}.stat strong{{font-size:20px;font-variant-numeric:tabular-nums;text-shadow:0 2px 14px #000}}
 
@@ -1174,25 +1556,25 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
             };
             html.push_str(&format!(
                 r#"<article class="position {side_class}"><div class="position-top">
-<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage}x kaldıraç · {notional} USDT pozisyon</div></div>
+<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage}x kaldıraç · {notional} USDT · TP aşaması {tp_stage}/3</div></div>
 <div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong class="{pnl_class}">{pnl_usd} USDT</strong><small>{pnl_percent}</small></div></div></div>
 <div class="price-grid"><div><span>Giriş</span><b>{entry}</b></div><div><span>Anlık</span><b>{current}</b></div><div><span>Miktar</span><b>{quantity}</b></div></div>
-<div class="risk-row"><span>Marjin <b>{margin} USDT</b></span><span>Stop <b>{stop}</b></span><span>Hedef <b>{take_profit}</b></span></div></article>"#,
-                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=leverage_text,notional=notional_text,pnl_class=pnl_class,
+<div class="risk-row"><span>Marjin <b>{margin} USDT</b></span><span>Stop <b>{stop}</b></span><span>TP1 <b>{tp1}</b></span><span>TP2 <b>{tp2}</b></span><span>Trend hedefi <b>{take_profit}</b></span></div></article>"#,
+                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=leverage_text,notional=notional_text,pnl_class=pnl_class,tp_stage=position.tp_stage,
                 side=escape_html(&position.side),pnl_usd=pnl_usd_text,pnl_percent=pnl_percent_text,entry=format_price(position.entry_price),
                 current=format_price(position.current_price),quantity=format_quantity(&position.quantity),margin=margin_text,
-                stop=format_price(position.stop_loss),take_profit=format_price(position.take_profit)
+                stop=format_price(position.stop_loss),tp1=format_price(position.tp1_price),tp2=format_price(position.tp2_price),take_profit=format_price(position.take_profit)
             ));
         }
     }
 
     html.push_str(&format!(
         r#"</section><div class="section-head"><h2>İşlem Geçmişi</h2><span>{closed} kapanan · İşlem başı {expectancy} USDT</span></div>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Sonuç</th><th>PnL</th><th>PnL &#36;</th></tr></thead><tbody>"#,
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Kapanış</th><th>Maks. PnL</th><th>PnL</th><th>PnL &#36;</th></tr></thead><tbody>"#,
         closed=state.accounting.closed_trades_count,expectancy=format_money(state.stats.expectancy, true)
     ));
     if state.history.is_empty() {
-        html.push_str(r#"<tr><td colspan="8" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
+        html.push_str(r#"<tr><td colspan="9" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
     } else {
         for trade in &state.history {
             let side_class = if trade.side == "LONG" {
@@ -1206,9 +1588,10 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
                 "negative"
             };
             html.push_str(&format!(
-                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{status}</td><td class="{pnl_class}">{pnl_percent}</td><td class="{pnl_class}">{pnl_usd} USDT</td></tr>"#,
+                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{exit_stage}: {status}</td><td>{max_pnl}</td><td class="{pnl_class}">{pnl_percent}</td><td class="{pnl_class}">{pnl_usd} USDT</td></tr>"#,
                 id=trade.id,symbol=escape_html(&trade.symbol),side_class=side_class,side=escape_html(&trade.side),
                 entry=format_price(trade.entry_price),exit=format_price(trade.exit_price),status=escape_html(&trade.status),
+                exit_stage=escape_html(&trade.exit_stage),max_pnl=format_percent(trade.max_pnl_percent, 2, true),
                 pnl_class=pnl_class,pnl_percent=format_percent(trade.pnl_percent, 2, true),pnl_usd=format_money(trade.pnl_usd, true)
             ));
         }
@@ -1240,6 +1623,11 @@ fn main() {
             .and_then(|value| value.parse().ok())
             .unwrap_or(20)
             .clamp(5, 50),
+        max_trade_allocation: env::var("MAX_TRADE_ALLOCATION")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| (0.01..=0.10).contains(value))
+            .unwrap_or(0.10),
         risk_per_trade: env::var("RISK_PER_TRADE")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -1306,6 +1694,7 @@ fn main() {
         history: initial_history,
         accounting: DailyAccounting {
             date: initial_accounting.date,
+
             starting_balance: initial_accounting.starting_balance,
             current_balance: initial_accounting.current_balance,
             total_roi: initial_accounting.total_roi,
@@ -1393,8 +1782,8 @@ mod tests {
             step_size: 0.001,
         };
         let (quantity, margin, risk) =
-            calculate_position_size(1_000.0, 100.0, 98.5, 3.0, 0.005, &filters).unwrap();
-        assert!(margin <= MAX_POSITION_MARGIN_USDT);
+            calculate_position_size(1_000.0, 100.0, 98.5, 3.0, 0.005, 0.10, &filters).unwrap();
+        assert!(margin <= 100.0);
         assert!(risk <= 5.0 + 1e-9);
         assert!(quantity > 0.0);
     }
@@ -1406,6 +1795,7 @@ mod tests {
             bid_price: "99.95".to_string(),
             ask_price: "100.05".to_string(),
         };
+
         let crossed = BookTicker {
             symbol: "TESTUSDT".to_string(),
             bid_price: "101".to_string(),
@@ -1435,5 +1825,37 @@ mod tests {
         assert!(!is_tradeable_usdt_symbol("BTC-USDT"));
         assert!(!is_tradeable_usdt_symbol("USDT"));
         assert!(!is_tradeable_usdt_symbol("btcusdt"));
+    }
+
+    #[test]
+    fn trade_pnl_includes_round_trip_fees() {
+        let long = calculate_trade_pnl("LONG", 100.0, 102.0, 10.0).unwrap();
+        let short = calculate_trade_pnl("SHORT", 100.0, 98.0, 10.0).unwrap();
+        assert!(long > 0.0);
+        assert!(short > 0.0);
+        assert!(long < 20.0);
+        assert!(short < 20.0);
+    }
+
+    #[test]
+    fn fast_indicators_detect_uptrend() {
+        let closes: Vec<f64> = (0..60).map(|index| 100.0 + index as f64 * 0.2).collect();
+        let highs: Vec<f64> = closes.iter().map(|close| close + 0.1).collect();
+        let lows: Vec<f64> = closes.iter().map(|close| close - 0.1).collect();
+        let indicators = calculate_fast_indicators(&highs, &lows, &closes).unwrap();
+        assert!(indicators.ema_fast > indicators.ema_slow);
+        assert!(indicators.rsi > 50.0);
+        assert!(indicators.atr > 0.0);
+    }
+
+    #[test]
+    fn partial_take_profit_respects_lot_step() {
+        let filters = SymbolFilters {
+            min_qty: 0.001,
+            max_qty: 100.0,
+            step_size: 0.001,
+        };
+        assert_eq!(partial_quantity(10.0, 10.0, 0.30, &filters), Some(3.0));
+        assert_eq!(partial_quantity(10.0, 1.0, 0.30, &filters), Some(1.0));
     }
 }
