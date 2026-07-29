@@ -1088,7 +1088,10 @@ fn main() {
             .replace("--SUCC--", &state.accounting.successful_trades.to_string())
             .replace("--PF--", &format!("{:.2}", state.stats.profit_factor))
             .replace("--EXPECTANCY--", &format!("{:+.2}", state.stats.expectancy))
-            .replace("--GROSS_PROFIT--", &format!("{:.2}", state.stats.gross_profit))
+            .replace(
+                "--GROSS_PROFIT--",
+                &format!("{:.2}", state.stats.gross_profit),
+            )
             .replace("--GROSS_LOSS--", &format!("{:.2}", state.stats.gross_loss));
 
         if state.positions.is_empty() {
