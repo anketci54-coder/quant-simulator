@@ -125,6 +125,8 @@ struct Config {
     base_url: String,
     entry_enabled: bool,
     max_positions: usize,
+    max_same_side_positions: usize,
+    max_signal_candidates: usize,
     risk_per_trade: f64,
     max_portfolio_risk: f64,
     session_loss_limit: f64,
@@ -133,6 +135,14 @@ struct Config {
     min_quote_volume: f64,
     max_spread_percent: f64,
     obi_confirmation_samples: usize,
+}
+
+fn is_tradeable_usdt_symbol(symbol: &str) -> bool {
+    let base = symbol.strip_suffix("USDT").unwrap_or_default();
+    (2..=16).contains(&base.len())
+        && base
+            .bytes()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
 }
 
 impl Config {
@@ -838,10 +848,28 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 if safety_allows_entries {
-                    for t in &tickers {
-                        if !t.symbol.ends_with("USDT") {
-                            continue;
-                        }
+                    let mut candidates: Vec<&Ticker> = tickers
+                        .iter()
+                        .filter(|ticker| is_tradeable_usdt_symbol(&ticker.symbol))
+                        .filter(|ticker| {
+                            ticker
+                                .quote_volume
+                                .parse::<f64>()
+                                .is_ok_and(|volume| volume >= config.min_quote_volume)
+                                && ticker
+                                    .price_change_percent
+                                    .parse::<f64>()
+                                    .is_ok_and(|change| change.abs() > 2.0)
+                        })
+                        .collect();
+                    candidates.sort_by(|left, right| {
+                        let left_volume = left.quote_volume.parse::<f64>().unwrap_or(0.0);
+                        let right_volume = right.quote_volume.parse::<f64>().unwrap_or(0.0);
+                        right_volume.total_cmp(&left_volume)
+                    });
+                    candidates.truncate(config.max_signal_candidates);
+
+                    for t in candidates {
                         let (Ok(change), Ok(vol), Ok(price)) = (
                             t.price_change_percent.parse::<f64>(),
                             t.quote_volume.parse::<f64>(),
@@ -891,6 +919,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             || cooling_down
                             || still_active.len() >= config.max_positions
                         {
+                            continue;
+                        }
+                        let same_side_count = still_active
+                            .iter()
+                            .filter(|position| position.side == side)
+                            .count();
+                        if same_side_count >= config.max_same_side_positions {
                             continue;
                         }
                         let committed_margin: f64 = still_active
@@ -1132,13 +1167,18 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
             let pnl_usd_text = format_money(position.pnl_usd, true);
             let pnl_percent_text = format_percent(position.pnl_percent, 2, true);
             let margin_text = format_money(position.margin_usdt, false);
+            let pnl_class = if position.pnl_usd >= 0.0 {
+                "positive"
+            } else {
+                "negative"
+            };
             html.push_str(&format!(
                 r#"<article class="position {side_class}"><div class="position-top">
 <div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage}x kaldıraç · {notional} USDT pozisyon</div></div>
-<div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong>{pnl_usd} USDT</strong><small>{pnl_percent}</small></div></div></div>
+<div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong class="{pnl_class}">{pnl_usd} USDT</strong><small>{pnl_percent}</small></div></div></div>
 <div class="price-grid"><div><span>Giriş</span><b>{entry}</b></div><div><span>Anlık</span><b>{current}</b></div><div><span>Miktar</span><b>{quantity}</b></div></div>
 <div class="risk-row"><span>Marjin <b>{margin} USDT</b></span><span>Stop <b>{stop}</b></span><span>Hedef <b>{take_profit}</b></span></div></article>"#,
-                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=leverage_text,notional=notional_text,
+                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=leverage_text,notional=notional_text,pnl_class=pnl_class,
                 side=escape_html(&position.side),pnl_usd=pnl_usd_text,pnl_percent=pnl_percent_text,entry=format_price(position.entry_price),
                 current=format_price(position.current_price),quantity=format_quantity(&position.quantity),margin=margin_text,
                 stop=format_price(position.stop_loss),take_profit=format_price(position.take_profit)
@@ -1188,23 +1228,38 @@ fn main() {
         max_positions: env::var("MAX_POSITIONS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(5),
+            .unwrap_or(10)
+            .clamp(1, 10),
+        max_same_side_positions: env::var("MAX_SAME_SIDE_POSITIONS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3)
+            .clamp(1, 5),
+        max_signal_candidates: env::var("MAX_SIGNAL_CANDIDATES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(20)
+            .clamp(5, 50),
         risk_per_trade: env::var("RISK_PER_TRADE")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|value| (0.0..=0.02).contains(value))
             .unwrap_or(0.005),
         max_portfolio_risk: env::var("MAX_PORTFOLIO_RISK")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|value| (0.0..=0.10).contains(value))
             .unwrap_or(0.02),
         session_loss_limit: env::var("SESSION_LOSS_LIMIT")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|value| (0.0..=0.10).contains(value))
             .unwrap_or(0.02),
         max_consecutive_losses: env::var("MAX_CONSECUTIVE_LOSSES")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(3),
+            .unwrap_or(3)
+            .clamp(1, 10),
         cooldown: Duration::from_secs(
             env::var("SYMBOL_COOLDOWN_SECONDS")
                 .ok()
@@ -1222,7 +1277,8 @@ fn main() {
         obi_confirmation_samples: env::var("OBI_CONFIRMATION_SAMPLES")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(3),
+            .unwrap_or(3)
+            .clamp(1, 10),
     };
     let db = match init_db() {
         Ok(db) => db,
@@ -1262,6 +1318,7 @@ fn main() {
     }));
 
     let s_clone = Arc::clone(&shared_state);
+
     let db_clone = Arc::clone(&db_conn);
     let cfg_clone = config.clone();
     thread::spawn(move || {
@@ -1368,5 +1425,15 @@ mod tests {
         assert_eq!(format_money(10_000.0, false), "10.000,00");
         assert_eq!(format_money(-1_234.5, true), "-1.234,50");
         assert_eq!(format_percent(12.5, 2, true), "+12,50%");
+    }
+
+    #[test]
+    fn symbol_filter_rejects_testnet_noise() {
+        assert!(is_tradeable_usdt_symbol("BTCUSDT"));
+        assert!(is_tradeable_usdt_symbol("1000PEPEUSDT"));
+        assert!(!is_tradeable_usdt_symbol("我踏马来了USDT"));
+        assert!(!is_tradeable_usdt_symbol("BTC-USDT"));
+        assert!(!is_tradeable_usdt_symbol("USDT"));
+        assert!(!is_tradeable_usdt_symbol("btcusdt"));
     }
 }

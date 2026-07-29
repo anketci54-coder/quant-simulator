@@ -29,7 +29,8 @@ Panel varsayılan olarak yalnızca `127.0.0.1:8080` üzerinde dinler.
 ## Risk modeli
 
 - Varsayılan olarak yeni girişler kapalıdır (`ENTRY_ENABLED=false`)
-- En fazla 5 eşzamanlı pozisyon
+- En fazla 10 eşzamanlı pozisyon
+- Aynı yönde en fazla 3 pozisyon (`MAX_SAME_SIDE_POSITIONS`)
 - İşlem başına en fazla %0,5 bakiye riski
 - Toplam açık portföy riski en fazla %2
 - Pozisyon marjı en fazla 100 USDT
@@ -37,6 +38,7 @@ Panel varsayılan olarak yalnızca `127.0.0.1:8080` üzerinde dinler.
 - Sembol başına bir saat cooldown
 - 3x kaldıraç
 - En az 20M USDT hacim, en fazla %0,10 spread ve üç ardışık OBI teyidi
+- Yalnızca standart ASCII `*USDT` sembolleri; tarama başına en likit 20 aday
 - Futures `exchangeInfo` üzerinden sembol bazlı `LOT_SIZE`
 - Başlangıçta bakiye `closed_trades` ledger toplamından otomatik uzlaştırılır
 - Peak PnL tabanlı break-even ve trailing stop
@@ -52,4 +54,4 @@ Panel varsayılan olarak yalnızca `127.0.0.1:8080` üzerinde dinler.
 - Tick-size, min-notional ve liquidation kontrolleri
 - Funding, gerçek komisyon ve slipaj modeli
 - Binance ile yeniden başlatma reconciliation
-- Günlük zarar limiti ve acil durdurma
+- Kalıcı günlük zarar baz çizgisi ve operatör acil-durdurma anahtarı
