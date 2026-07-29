@@ -108,17 +108,6 @@ fn init_db() -> Connection {
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", []);
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", []);
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []);
-    
-    let column_exists: Result<i64, _> = conn.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('active_positions') WHERE name='highest_price'",
-        [],
-        |row| row.get(0)
-    );
-    if let Ok(count) = column_exists {
-        if count > 0 {
-            let _ = conn.execute("ALTER TABLE active_positions RENAME COLUMN highest_price TO best_price", []);
-        }
-    }
     conn
 }
 
@@ -138,37 +127,19 @@ fn get_max_active_id(conn: &Mutex<Connection>) -> usize {
     } else { 0 }
 }
 
-fn atomic_close_and_save_position(conn: &Mutex<Connection>, h: &ClosedPosition, positions: &[ActivePosition], acc: &DailyAccounting) -> Result<(), String> {
+fn atomic_batch_save(conn: &Mutex<Connection>, closed_list: &[ClosedPosition], active_list: &[ActivePosition], acc: &DailyAccounting) -> Result<(), String> {
     let mut c = conn.lock().map_err(|e| e.to_string())?;
     let tx = c.transaction().map_err(|e| e.to_string())?;
 
-    tx.execute(
-        "INSERT INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd],
-    ).map_err(|e| e.to_string())?;
-
-    tx.execute("DELETE FROM active_positions", []).map_err(|e| e.to_string())?;
-    for p in positions {
-        let lc_str = match p.lifecycle { PositionLifecycle::PendingOpen => "PendingOpen", PositionLifecycle::Open => "Open", PositionLifecycle::Closed => "Closed" };
+    for h in closed_list {
         tx.execute(
-            "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone()],
+            "INSERT OR IGNORE INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd],
         ).map_err(|e| e.to_string())?;
     }
 
-    tx.execute("INSERT OR REPLACE INTO kv_store (key, value) VALUES ('current_balance', ?1)", params![acc.current_balance.to_string()]).map_err(|e| e.to_string())?;
-    tx.execute("INSERT OR REPLACE INTO kv_store (key, value) VALUES ('starting_balance', ?1)", params![acc.starting_balance.to_string()]).map_err(|e| e.to_string())?;
-
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn atomic_save_active_positions(conn: &Mutex<Connection>, positions: &[ActivePosition], acc: &DailyAccounting) -> Result<(), String> {
-    let mut c = conn.lock().map_err(|e| e.to_string())?;
-    let tx = c.transaction().map_err(|e| e.to_string())?;
-
     tx.execute("DELETE FROM active_positions", []).map_err(|e| e.to_string())?;
-    for p in positions {
+    for p in active_list {
         let lc_str = match p.lifecycle { PositionLifecycle::PendingOpen => "PendingOpen", PositionLifecycle::Open => "Open", PositionLifecycle::Closed => "Closed" };
         tx.execute(
             "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
@@ -216,9 +187,7 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
     }).map_err(|e| e.to_string())?;
 
     for r in iter {
-        if let Ok(pos) = r {
-            positions.push(pos);
-        }
+        if let Ok(pos) = r { positions.push(pos); }
     }
     Ok(positions)
 }
@@ -226,7 +195,6 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
 fn load_history_from_db(conn: &Mutex<Connection>) -> Result<(Vec<ClosedPosition>, usize, usize), String> {
     let mut history = Vec::new();
     let c = conn.lock().map_err(|e| e.to_string())?;
-    
     let total_count: usize = c.query_row("SELECT COUNT(*) FROM closed_trades", [], |row| row.get::<_, i64>(0)).unwrap_or(0) as usize;
     let successful_count: usize = c.query_row("SELECT COUNT(*) FROM closed_trades WHERE pnl_percent > 0", [], |row| row.get::<_, i64>(0)).unwrap_or(0) as usize;
 
@@ -245,9 +213,7 @@ fn load_history_from_db(conn: &Mutex<Connection>) -> Result<(Vec<ClosedPosition>
     }).map_err(|e| e.to_string())?;
 
     for r in iter {
-        if let Ok(h) = r {
-            history.push(h);
-        }
+        if let Ok(h) = r { history.push(h); }
     }
     history.reverse();
     Ok((history, total_count, successful_count))
@@ -281,9 +247,10 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
         match tickers_result {
             Ok(tickers) => {
                 let mut state = match shared_state.lock() { Ok(s) => s.clone(), Err(_) => { thread::sleep(Duration::from_secs(1)); continue; } };
-                let mut realized_pnl_usd = 0.0;
+                let mut newly_closed = Vec::new();
                 let mut still_active = Vec::new();
                 let mut current_err = String::from("Sistem Kararlı Çalışıyor (Gelişmiş Break-Even & Trailing Modu)");
+                let mut batch_realized_pnl = 0.0;
 
                 for mut pos in state.positions {
                     if pos.lifecycle == PositionLifecycle::PendingOpen {
@@ -301,11 +268,8 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             pos.peak_pnl_percent = pos.peak_pnl_percent.max(pos.pnl_percent);
 
                             if pos.peak_pnl_percent >= 2.5 && pos.peak_pnl_percent < 5.0 {
-                                if pos.side == "LONG" && pos.stop_loss < pos.entry_price {
-                                    pos.stop_loss = pos.entry_price;
-                                } else if pos.side == "SHORT" && pos.stop_loss > pos.entry_price {
-                                    pos.stop_loss = pos.entry_price;
-                                }
+                                if pos.side == "LONG" && pos.stop_loss < pos.entry_price { pos.stop_loss = pos.entry_price; }
+                                else if pos.side == "SHORT" && pos.stop_loss > pos.entry_price { pos.stop_loss = pos.entry_price; }
                             } else if pos.peak_pnl_percent >= 5.0 {
                                 if pos.side == "LONG" {
                                     let trailed_sl = pos.best_price * 0.992;
@@ -325,34 +289,19 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                 if curr_price >= pos.stop_loss { close_reason = Some("SL / Break-Even Hit".to_string()); }
                                 else if curr_price <= pos.take_profit { close_reason = Some("TP Hit".to_string()); }
                             }
+
                             if let Some(reason) = close_reason {
                                 pos.lifecycle = PositionLifecycle::Closed;
-                                realized_pnl_usd += pos.pnl_usd;
-                                
-                                state.accounting.current_balance += realized_pnl_usd;
-                                if state.accounting.starting_balance > 0.0 { 
-                                    state.accounting.total_roi = ((state.accounting.current_balance - state.accounting.starting_balance) / state.accounting.starting_balance) * 100.0; 
-                                }
-
-                                let closed_trade = ClosedPosition { id: pos.id, symbol: pos.symbol.clone(), side: pos.side.clone(), entry_price: pos.entry_price, exit_price: curr_price, status: reason, pnl_percent: pos.pnl_percent, pnl_usd: pos.pnl_usd };
-                                
-                                if let Err(e) = atomic_close_and_save_position(&db_conn, &closed_trade, &still_active, &state.accounting) {
-                                    current_err = format!("DB Transaction Hatası: {}", e);
-                                }
-                            } else { still_active.push(pos); }
+                                batch_realized_pnl += pos.pnl_usd;
+                                newly_closed.push(ClosedPosition { id: pos.id, symbol: pos.symbol.clone(), side: pos.side.clone(), entry_price: pos.entry_price, exit_price: curr_price, status: reason, pnl_percent: pos.pnl_percent, pnl_usd: pos.pnl_usd });
+                            } else {
+                                still_active.push(pos);
+                            }
                         } else { still_active.push(pos); }
                     } else { still_active.push(pos); }
                 }
 
-                if realized_pnl_usd == 0.0 {
-                    state.accounting.current_balance += realized_pnl_usd;
-                    if state.accounting.starting_balance > 0.0 { 
-                        state.accounting.total_roi = ((state.accounting.current_balance - state.accounting.starting_balance) / state.accounting.starting_balance) * 100.0; 
-                    }
-                    if let Err(e) = atomic_save_active_positions(&db_conn, &still_active, &state.accounting) {
-                        current_err = format!("DB Active Positions Kayıt Hatası: {}", e);
-                    }
-                }
+                state.accounting.current_balance += batch_realized_pnl;
 
                 for t in &tickers {
                     if t.symbol.ends_with("USDT") {
@@ -382,7 +331,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                                     stop_loss, take_profit, best_price: price, peak_pnl_percent: -0.04 * lev, leverage: lev, margin_usdt: POSITION_MARGIN_USDT,
                                                     lifecycle: PositionLifecycle::PendingOpen, status: format!("Simüle Emir Gönderildi ({})", side), pnl_percent: -0.04 * lev, pnl_usd: -(POSITION_MARGIN_USDT * 0.0004 * lev), quantity: qty_str,
                                                 });
-                                                let _ = atomic_save_active_positions(&db_conn, &still_active, &state.accounting);
                                             }
                                         }
                                     }
@@ -391,6 +339,15 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         }
                     }
                 }
+
+                if state.accounting.starting_balance > 0.0 { 
+                    state.accounting.total_roi = ((state.accounting.current_balance - state.accounting.starting_balance) / state.accounting.starting_balance) * 100.0; 
+                }
+
+                if let Err(e) = atomic_batch_save(&db_conn, &newly_closed, &still_active, &state.accounting) {
+                    current_err = format!("DB Batch Transaction Hatası: {}", e);
+                }
+
                 state.positions = still_active;
                 
                 if let Ok((hist, tot_count, succ_count)) = load_history_from_db(&db_conn) {
@@ -480,7 +437,7 @@ fn main() {
             }
         }
 
-        html.push_str(r#"</table><h2>Kapatılan İşlemler (SQLite - Atomic Transactions)</h2><table><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Sonuç</th><th>PnL %</th><th>PnL $</th></tr>"#);
+        html.push_str(r#"</table><h2>Kapatılan İşlemler (SQLite - Atomic Batch Transactions)</h2><table><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Sonuç</th><th>PnL %</th><th>PnL $</th></tr>"#);
         if state.history.is_empty() {
             html.push_str("<tr><td colspan=\"8\" style=\"text-align: center;\">Kapatılan işlem yok.</td></tr>");
         } else {
