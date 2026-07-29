@@ -589,7 +589,12 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     .send()
                     .and_then(|r| r.error_for_status())
                     .and_then(|r| r.json::<Vec<BookTicker>>())
-                    .map(|books| books.into_iter().map(|book| (book.symbol.clone(), book)).collect())
+                    .map(|books| {
+                        books
+                            .into_iter()
+                            .map(|book| (book.symbol.clone(), book))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let mut state = match shared_state.lock() {
                     Ok(s) => s.clone(),
@@ -714,9 +719,14 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     current_err = if !config.entry_enabled {
                         "Yeni girişler ENTRY_ENABLED ile durduruldu".to_string()
                     } else if consecutive_losses >= config.max_consecutive_losses {
-                        format!("Ardışık {consecutive_losses} kayıp sonrası yeni girişler kilitlendi")
+                        format!(
+                            "Ardışık {consecutive_losses} kayıp sonrası yeni girişler kilitlendi"
+                        )
                     } else {
-                        format!("Seans zarar limiti aşıldı: %{:.2}", session_drawdown * 100.0)
+                        format!(
+                            "Seans zarar limiti aşıldı: %{:.2}",
+                            session_drawdown * 100.0
+                        )
                     };
                 }
 
@@ -735,12 +745,18 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if price <= 0.0 || vol < config.min_quote_volume || change.abs() <= 2.0 {
                             continue;
                         }
-                        let Some(book) = book_map.get(&t.symbol) else { continue; };
-                        let Some(spread) = spread_percent(book) else { continue; };
+                        let Some(book) = book_map.get(&t.symbol) else {
+                            continue;
+                        };
+                        let Some(spread) = spread_percent(book) else {
+                            continue;
+                        };
                         if spread > config.max_spread_percent {
                             continue;
                         }
-                        let Ok(obi) = calculate_obi(&client, &config, &t.symbol) else { continue; };
+                        let Ok(obi) = calculate_obi(&client, &config, &t.symbol) else {
+                            continue;
+                        };
                         let samples = obi_samples.entry(t.symbol.clone()).or_default();
                         samples.push_back(obi);
                         while samples.len() > config.obi_confirmation_samples {
@@ -749,8 +765,10 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if samples.len() < config.obi_confirmation_samples {
                             continue;
                         }
-                        let long_confirmed = change > 2.0 && samples.iter().all(|value| *value >= 0.20);
-                        let short_confirmed = change < -2.0 && samples.iter().all(|value| *value <= -0.20);
+                        let long_confirmed =
+                            change > 2.0 && samples.iter().all(|value| *value >= 0.20);
+                        let short_confirmed =
+                            change < -2.0 && samples.iter().all(|value| *value <= -0.20);
                         let (side, leverage) = if long_confirmed {
                             ("LONG", 3.0)
                         } else if short_confirmed {
@@ -762,11 +780,16 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         let cooling_down = symbol_cooldowns
                             .get(&t.symbol)
                             .is_some_and(|closed_at| closed_at.elapsed() < config.cooldown);
-                        if already_active || cooling_down || still_active.len() >= config.max_positions {
+                        if already_active
+                            || cooling_down
+                            || still_active.len() >= config.max_positions
+                        {
                             continue;
                         }
-                        let committed_margin: f64 =
-                            still_active.iter().map(|position| position.margin_usdt).sum();
+                        let committed_margin: f64 = still_active
+                            .iter()
+                            .map(|position| position.margin_usdt)
+                            .sum();
                         let free_margin = state.accounting.current_balance - committed_margin;
                         if free_margin <= 0.0 {
                             continue;
@@ -776,7 +799,9 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         } else {
                             (price * 1.015, price * 0.965)
                         };
-                        let Some(filters) = symbol_filters.get(&t.symbol) else { continue; };
+                        let Some(filters) = symbol_filters.get(&t.symbol) else {
+                            continue;
+                        };
                         let Some((quantity, margin_usdt, new_risk)) = calculate_position_size(
                             state.accounting.current_balance,
                             price,
@@ -1111,5 +1136,4 @@ mod tests {
         assert!((spread_percent(&liquid).unwrap() - 0.1).abs() < 1e-9);
         assert_eq!(spread_percent(&crossed), None);
     }
-
 }
