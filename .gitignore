@@ -1,4 +1,6 @@
 .env
 target/
-target/
 output.log
+quant_history.db
+quant_history.db-shm
+quant_history.db-wal
