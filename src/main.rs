@@ -174,27 +174,34 @@ struct AppState {
 
 type SharedState = Arc<Mutex<AppState>>;
 
-fn init_db() -> Connection {
-    let conn = Connection::open("quant_history.db").expect("SQLite veritabanı açılamadı!");
-    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;");
-    let _ = conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", []);
-    let _ = conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", []);
-    let _ = conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []);
-    conn
+fn init_db() -> Result<Connection, String> {
+    let conn = Connection::open("quant_history.db")
+        .map_err(|e| format!("SQLite veritabanı açılamadı: {e}"))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")
+        .map_err(|e| format!("SQLite PRAGMA ayarlanamadı: {e}"))?;
+    conn.execute("CREATE TABLE IF NOT EXISTS closed_trades (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL)", [])
+        .map_err(|e| format!("closed_trades şeması oluşturulamadı: {e}"))?;
+    conn.execute("CREATE TABLE IF NOT EXISTS active_positions (id INTEGER PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_price REAL NOT NULL, current_price REAL NOT NULL, stop_loss REAL NOT NULL, take_profit REAL NOT NULL, best_price REAL NOT NULL, peak_pnl_percent REAL NOT NULL, leverage REAL NOT NULL, margin_usdt REAL NOT NULL, lifecycle TEXT NOT NULL, status TEXT NOT NULL, pnl_percent REAL NOT NULL, pnl_usd REAL NOT NULL, quantity TEXT NOT NULL)", [])
+        .map_err(|e| format!("active_positions şeması oluşturulamadı: {e}"))?;
+    conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])
+        .map_err(|e| format!("kv_store şeması oluşturulamadı: {e}"))?;
+    Ok(conn)
 }
 
 fn get_max_closed_id(conn: &Mutex<Connection>) -> usize {
     if let Ok(c) = conn.lock() {
-        let mut stmt = c.prepare("SELECT COALESCE(MAX(id), 0) FROM closed_trades").unwrap();
-        let max_id: i64 = stmt.query_row([], |row| row.get(0)).unwrap_or(0);
+        let max_id: i64 = c
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM closed_trades", [], |row| row.get(0))
+            .unwrap_or(0);
         max_id as usize
     } else { 0 }
 }
 
 fn get_max_active_id(conn: &Mutex<Connection>) -> usize {
     if let Ok(c) = conn.lock() {
-        let mut stmt = c.prepare("SELECT COALESCE(MAX(id), 0) FROM active_positions").unwrap();
-        let max_id: i64 = stmt.query_row([], |row| row.get(0)).unwrap_or(0);
+        let max_id: i64 = c
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM active_positions", [], |row| row.get(0))
+            .unwrap_or(0);
         max_id as usize
     } else { 0 }
 }
@@ -258,8 +265,8 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
         })
     }).map_err(|e| e.to_string())?;
 
-    for r in iter {
-        if let Ok(pos) = r { positions.push(pos); }
+    for row in iter {
+        positions.push(row.map_err(|e| format!("Aktif pozisyon satırı okunamadı: {e}"))?);
     }
     Ok(positions)
 }
@@ -284,8 +291,8 @@ fn load_history_from_db(conn: &Mutex<Connection>) -> Result<(Vec<ClosedPosition>
         })
     }).map_err(|e| e.to_string())?;
 
-    for r in iter {
-        if let Ok(h) = r { history.push(h); }
+    for row in iter {
+        history.push(row.map_err(|e| format!("Geçmiş işlem satırı okunamadı: {e}"))?);
     }
     history.reverse();
     Ok((history, total_count, successful_count))
@@ -299,7 +306,10 @@ fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> D
         if let Ok(val) = c.query_row("SELECT value FROM kv_store WHERE key='current_balance'", [], |row| row.get::<_, String>(0)) { if let Ok(p) = val.parse::<f64>() { current = p; } }
     }
     let total_roi = if starting > 0.0 { ((current - starting) / starting) * 100.0 } else { 0.0 };
-    DailyAccounting { date: "2026-07-28".to_string(), starting_balance: starting, current_balance: current, total_roi, closed_trades_count: 0, successful_trades: 0 }
+    let date = conn.lock().ok()
+        .and_then(|c| c.query_row("SELECT date('now')", [], |row| row.get::<_, String>(0)).ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    DailyAccounting { date, starting_balance: starting, current_balance: current, total_roi, closed_trades_count: 0, successful_trades: 0 }
 }
 
 fn fetch_symbol_filters(client: &reqwest::blocking::Client, config: &Config) -> Result<HashMap<String, SymbolFilters>, String> {
@@ -514,7 +524,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
 fn main() {
     dotenv().ok();
     let config = Config { base_url: env::var("BINANCE_BASE_URL").unwrap_or_else(|_| "https://testnet.binancefuture.com".into()) };
-    let db = init_db();
+    let db = match init_db() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("{e}");
+            return;
+        }
+    };
     let db_conn = Arc::new(Mutex::new(db));
     let next_id = get_max_closed_id(&db_conn).max(get_max_active_id(&db_conn)) + 1;
     
@@ -540,8 +556,15 @@ fn main() {
     let cfg_clone = config.clone();
     thread::spawn(move || { run_engine(cfg_clone, s_clone, db_clone); });
 
-    let server = Server::http("0.0.0.0:8080").unwrap();
-    println!("🚀 Kararlı Quant Paneli Yayında!");
+    let panel_bind = env::var("PANEL_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+    let server = match Server::http(&panel_bind) {
+        Ok(server) => server,
+        Err(e) => {
+            eprintln!("Panel sunucusu başlatılamadı ({panel_bind}): {e}");
+            return;
+        }
+    };
+    println!("🚀 Quant paneli {panel_bind} adresinde yayında");
 
     for request in server.incoming_requests() {
         let state = match shared_state.lock() { Ok(s) => s.clone(), Err(_) => continue };
