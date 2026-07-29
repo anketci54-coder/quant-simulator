@@ -118,7 +118,6 @@ enum PositionLifecycle {
     PendingOpen,
     Open,
     Closed,
-
 }
 
 #[derive(Clone)]
@@ -239,7 +238,6 @@ fn format_quantity(value: &str) -> String {
                 } else {
                     trimmed
                 }
-
             }
         })
         .unwrap_or_else(|_| value.to_string())
@@ -360,7 +358,6 @@ fn get_max_active_id(conn: &Mutex<Connection>) -> usize {
             )
             .unwrap_or(0);
         max_id as usize
-
     } else {
         0
     }
@@ -481,7 +478,6 @@ fn load_history_from_db(
                 status: row.get(5)?,
                 pnl_percent: row.get(6)?,
                 pnl_usd: row.get(7)?,
-
             })
         })
         .map_err(|e| e.to_string())?;
@@ -602,7 +598,6 @@ fn fetch_symbol_filters(
                             min_qty,
                             max_qty,
                             step_size,
-
                         },
                     );
                 }
@@ -844,7 +839,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
 
                 if safety_allows_entries {
                     for t in &tickers {
-
                         if !t.symbol.ends_with("USDT") {
                             continue;
                         }
@@ -965,7 +959,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 if state.accounting.starting_balance > 0.0 {
-
                     state.accounting.total_roi = ((state.accounting.current_balance
                         - state.accounting.starting_balance)
                         / state.accounting.starting_balance)
@@ -1207,7 +1200,6 @@ fn main() {
         session_loss_limit: env::var("SESSION_LOSS_LIMIT")
             .ok()
             .and_then(|value| value.parse().ok())
-
             .unwrap_or(0.02),
         max_consecutive_losses: env::var("MAX_CONSECUTIVE_LOSSES")
             .ok()
