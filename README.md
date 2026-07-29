@@ -28,10 +28,17 @@ Panel varsayılan olarak yalnızca `127.0.0.1:8080` üzerinde dinler.
 
 ## Risk modeli
 
-- En fazla 10 eşzamanlı pozisyon
-- Pozisyon başına 100 USDT simüle marjin
+- Varsayılan olarak yeni girişler kapalıdır (`ENTRY_ENABLED=false`)
+- En fazla 5 eşzamanlı pozisyon
+- İşlem başına en fazla %0,5 bakiye riski
+- Toplam açık portföy riski en fazla %2
+- Pozisyon marjı en fazla 100 USDT
+- Üç ardışık kayıp veya %2 seans kaybında giriş kilidi
+- Sembol başına bir saat cooldown
 - 3x kaldıraç
+- En az 20M USDT hacim, en fazla %0,10 spread ve üç ardışık OBI teyidi
 - Futures `exchangeInfo` üzerinden sembol bazlı `LOT_SIZE`
+- Başlangıçta bakiye `closed_trades` ledger toplamından otomatik uzlaştırılır
 - Peak PnL tabanlı break-even ve trailing stop
 - SQLite WAL ve atomik batch snapshot
 - Varsayılan başlangıç bakiyesi: 1000 USDT
