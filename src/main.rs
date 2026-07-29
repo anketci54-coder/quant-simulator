@@ -1081,4 +1081,35 @@ mod tests {
         assert_eq!(quantize_quantity(1.23456, &filters), Some(1.234));
         assert_eq!(quantize_quantity(0.0005, &filters), None);
     }
+
+    #[test]
+    fn risk_sizing_caps_margin_and_loss() {
+        let filters = SymbolFilters {
+            min_qty: 0.001,
+            max_qty: 100_000.0,
+            step_size: 0.001,
+        };
+        let (quantity, margin, risk) =
+            calculate_position_size(1_000.0, 100.0, 98.5, 3.0, 0.005, &filters).unwrap();
+        assert!(margin <= MAX_POSITION_MARGIN_USDT);
+        assert!(risk <= 5.0 + 1e-9);
+        assert!(quantity > 0.0);
+    }
+
+    #[test]
+    fn spread_filter_rejects_invalid_books() {
+        let liquid = BookTicker {
+            symbol: "TESTUSDT".to_string(),
+            bid_price: "99.95".to_string(),
+            ask_price: "100.05".to_string(),
+        };
+        let crossed = BookTicker {
+            symbol: "TESTUSDT".to_string(),
+            bid_price: "101".to_string(),
+            ask_price: "100".to_string(),
+        };
+        assert!((spread_percent(&liquid).unwrap() - 0.1).abs() < 1e-9);
+        assert_eq!(spread_percent(&crossed), None);
+    }
+
 }
