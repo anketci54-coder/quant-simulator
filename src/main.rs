@@ -171,6 +171,43 @@ struct BookTicker {
     ask_price: String,
 }
 
+fn format_price(value: f64) -> String {
+    let precision = if value.abs() >= 1_000.0 {
+        2
+    } else if value.abs() >= 1.0 {
+        4
+    } else if value.abs() >= 0.01 {
+        6
+    } else {
+        8
+    };
+    let scale = 10_f64.powi(precision as i32);
+    let rounded = (value * scale).round() / scale;
+    format!("{rounded:.precision$}")
+}
+
+fn format_quantity(value: &str) -> String {
+    value
+        .parse::<f64>()
+        .map(|parsed| {
+            if parsed.abs() >= 1_000.0 {
+                let rounded = (parsed * 100.0).round() / 100.0;
+                format!("{rounded:.2}")
+            } else {
+                let trimmed = format!("{parsed:.8}")
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string();
+                if trimmed.is_empty() {
+                    "0".to_string()
+                } else {
+                    trimmed
+                }
+            }
+        })
+        .unwrap_or_else(|_| value.to_string())
+}
+
 fn spread_percent(book: &BookTicker) -> Option<f64> {
     let bid = book.bid_price.parse::<f64>().ok()?;
     let ask = book.ask_price.parse::<f64>().ok()?;
@@ -1002,7 +1039,12 @@ fn main() {
     let initial_positions = load_active_positions_from_db(&db_conn).unwrap_or_default();
     let (initial_history, total_closed, total_succ) =
         load_history_from_db(&db_conn).unwrap_or_default();
-    let initial_accounting = load_accounting_from_db(&db_conn, 1000.0);
+    let initial_balance = env::var("INITIAL_BALANCE_USDT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(10_000.0);
+    let initial_accounting = load_accounting_from_db(&db_conn, initial_balance);
     let initial_stats = load_performance_stats(&db_conn).unwrap_or_default();
 
     let shared_state: SharedState = Arc::new(Mutex::new(AppState {
@@ -1106,7 +1148,7 @@ fn main() {
                     PositionLifecycle::Open => "<span style='color:lightgreen;'>Open</span>",
                     PositionLifecycle::Closed => "Closed",
                 };
-                html.push_str(&format!("<tr><td>#{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>${:.0}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"pos\">{:+.2}%</td><td class=\"neg\">{}</td><td class=\"pos\">{}</td><td class=\"{}\">{:+.2}%</td><td class=\"{}\">${:+.2}</td></tr>", p.id, p.symbol, p.side, lc_str, p.margin_usdt, p.quantity, p.entry_price, p.current_price, p.peak_pnl_percent, p.stop_loss, p.take_profit, pnl_class, p.pnl_percent, pnl_class, p.pnl_usd));
+                html.push_str(&format!("<tr><td>#{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>${:.2}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"pos\">{:+.2}%</td><td class=\"neg\">{}</td><td class=\"pos\">{}</td><td class=\"{}\">{:+.2}%</td><td class=\"{}\">${:+.2}</td></tr>", p.id, p.symbol, p.side, lc_str, p.margin_usdt, format_quantity(&p.quantity), format_price(p.entry_price), format_price(p.current_price), p.peak_pnl_percent, format_price(p.stop_loss), format_price(p.take_profit), pnl_class, p.pnl_percent, pnl_class, p.pnl_usd));
             }
         }
 
@@ -1116,7 +1158,7 @@ fn main() {
         } else {
             for h in state.history {
                 let pnl_class = if h.pnl_percent >= 0.0 { "pos" } else { "neg" };
-                html.push_str(&format!("<tr><td>#{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{:+.2}%</td><td class=\"{}\">${:+.2}</td></tr>", h.id, h.symbol, h.side, h.entry_price, h.exit_price, h.status, pnl_class, h.pnl_percent, pnl_class, h.pnl_usd));
+                html.push_str(&format!("<tr><td>#{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{:+.2}%</td><td class=\"{}\">${:+.2}</td></tr>", h.id, h.symbol, h.side, format_price(h.entry_price), format_price(h.exit_price), h.status, pnl_class, h.pnl_percent, pnl_class, h.pnl_usd));
             }
         }
         html.push_str("</table></body></html>");
@@ -1185,5 +1227,14 @@ mod tests {
         };
         assert!((spread_percent(&liquid).unwrap() - 0.1).abs() < 1e-9);
         assert_eq!(spread_percent(&crossed), None);
+    }
+
+    #[test]
+    fn display_numbers_use_bounded_precision() {
+        assert_eq!(format_price(12_345.678_9), "12345.68");
+        assert_eq!(format_price(12.345678), "12.3457");
+        assert_eq!(format_price(0.123456789), "0.123457");
+        assert_eq!(format_price(0.00123456789), "0.00123457");
+        assert_eq!(format_quantity("199468.08500000"), "199468.09");
     }
 }
