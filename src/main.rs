@@ -521,7 +521,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 };
                 let mut newly_closed = Vec::new();
                 let mut still_active = Vec::new();
-                let mut current_err =
+                let current_err =
                     String::from("Sistem Kararlı Çalışıyor (Gelişmiş Break-Even & Trailing Modu)");
                 let mut batch_realized_pnl = 0.0;
 
@@ -559,9 +559,9 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
 
                             if pos.peak_pnl_percent >= 2.5 && pos.peak_pnl_percent < 5.0 {
                                 if let Some(be_stop) = break_even_stop(&pos.side, pos.entry_price) {
-                                    if pos.side == "LONG" && pos.stop_loss < be_stop {
-                                        pos.stop_loss = be_stop;
-                                    } else if pos.side == "SHORT" && pos.stop_loss > be_stop {
+                                    if (pos.side == "LONG" && pos.stop_loss < be_stop)
+                                        || (pos.side == "SHORT" && pos.stop_loss > be_stop)
+                                    {
                                         pos.stop_loss = be_stop;
                                     }
                                 }
