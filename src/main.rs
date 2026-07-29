@@ -263,8 +263,6 @@ struct DailyAccounting {
 
 #[derive(Clone, Default)]
 struct PerformanceStats {
-    gross_profit: f64,
-    gross_loss: f64,
     profit_factor: f64,
     expectancy: f64,
 }
@@ -478,8 +476,6 @@ fn load_performance_stats(conn: &Mutex<Connection>) -> Result<PerformanceStats, 
         0.0
     };
     Ok(PerformanceStats {
-        gross_profit,
-        gross_loss,
         profit_factor,
         expectancy,
     })
@@ -979,6 +975,160 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
     }
 }
 
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn render_dashboard(state: &AppState) -> String {
+    let roi_class = if state.accounting.total_roi >= 0.0 {
+        "positive"
+    } else {
+        "negative"
+    };
+    let win_rate = if state.accounting.closed_trades_count > 0 {
+        state.accounting.successful_trades as f64 / state.accounting.closed_trades_count as f64
+            * 100.0
+    } else {
+        0.0
+    };
+    let used_margin: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.margin_usdt)
+        .sum();
+    let open_pnl: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.pnl_usd)
+        .sum();
+    let status_text = if state.last_error.contains("ENTRY_ENABLED") {
+        "Yeni işlemler kapalı"
+    } else {
+        &state.last_error
+    };
+    let status_class = if state.last_error.contains("Hata") {
+        "status danger"
+    } else if state.last_error.contains("ENTRY_ENABLED") {
+        "status warning"
+    } else {
+        "status healthy"
+    };
+
+    let mut html = format!(
+        r#"<!doctype html>
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="3"><title>Quant Futures</title>
+<style>
+:root{{--bg:#0b0e11;--panel:#12161c;--panel2:#181d25;--line:#2a3039;--text:#eaecef;--muted:#848e9c;--gold:#f0b90b;--green:#0ecb81;--red:#f6465d}}
+*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top right,#181b15 0,#0b0e11 35%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}}
+.shell{{max-width:1500px;margin:auto;padding:24px}}.topbar{{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}}
+.brand{{display:flex;align-items:center;gap:12px}}.logo{{width:38px;height:38px;border-radius:10px;background:var(--gold);color:#111;display:grid;place-items:center;font-weight:900;font-size:19px;box-shadow:0 0 24px #f0b90b2b}}
+.brand h1{{font-size:20px;margin:0;letter-spacing:.2px}}.brand p{{margin:3px 0 0;color:var(--muted);font-size:12px}}
+.mode{{font-size:11px;color:#111;background:var(--gold);font-weight:800;padding:6px 10px;border-radius:6px;letter-spacing:.7px}}
+.status{{display:flex;align-items:center;gap:8px;padding:10px 13px;border:1px solid var(--line);background:var(--panel);border-radius:9px;color:var(--muted);font-size:13px}}
+.status:before{{content:"";width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}}.status.warning:before{{background:var(--gold);box-shadow:0 0 10px var(--gold)}}.status.danger:before{{background:var(--red);box-shadow:0 0 10px var(--red)}}
+.stats{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:24px}}.stat{{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:10px;padding:14px}}
+.stat span{{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.65px;margin-bottom:7px}}.stat strong{{font-size:19px;font-variant-numeric:tabular-nums}}
+.positive{{color:var(--green)!important}}.negative{{color:var(--red)!important}}.section-head{{display:flex;align-items:end;justify-content:space-between;margin:20px 0 12px}}.section-head h2{{font-size:16px;margin:0}}.section-head span{{font-size:12px;color:var(--muted)}}
+.position-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}}.position{{position:relative;overflow:hidden;background:linear-gradient(145deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:12px;padding:16px}}
+.position:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px}}.position.long{{border-color:#0ecb8142}}.position.long:before{{background:var(--green)}}.position.short{{border-color:#f6465d42}}.position.short:before{{background:var(--red)}}
+.position-top{{display:flex;justify-content:space-between;align-items:start;margin-bottom:17px}}.symbol{{font-size:18px;font-weight:800}}.side{{font-size:11px;font-weight:900;padding:5px 9px;border-radius:5px}}
+.long .side{{color:var(--green);background:#0ecb8119}}.short .side{{color:var(--red);background:#f6465d19}}.position-meta{{color:var(--muted);font-size:11px;margin-top:4px}}
+.pnl{{text-align:right}}.pnl strong{{display:block;font-size:22px;font-variant-numeric:tabular-nums}}.pnl small{{color:var(--muted)}}.long .pnl strong{{color:var(--green)}}.short .pnl strong{{color:var(--red)}}
+.price-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);padding-top:13px}}.price-grid span{{color:var(--muted);font-size:10px;display:block;margin-bottom:4px}}.price-grid b{{font-size:13px;font-variant-numeric:tabular-nums}}
+.risk-row{{display:flex;justify-content:space-between;margin-top:13px;padding-top:11px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}}.risk-row b{{color:var(--text)}}
+.empty{{background:var(--panel);border:1px dashed var(--line);border-radius:12px;padding:38px;text-align:center;color:var(--muted)}}.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}}
+table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);text-align:left;background:var(--panel2)}}th,td{{padding:12px 14px;border-bottom:1px solid var(--line)}}td{{font-size:12px;font-variant-numeric:tabular-nums}}tr:last-child td{{border-bottom:0}}
+.side-text.long{{color:var(--green);font-weight:800}}.side-text.short{{color:var(--red);font-weight:800}}footer{{color:var(--muted);font-size:10px;text-align:center;margin-top:22px}}
+@media(max-width:1000px){{.stats{{grid-template-columns:repeat(3,1fr)}}}}@media(max-width:650px){{.shell{{padding:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.stats{{grid-template-columns:repeat(2,1fr)}}.position-grid{{grid-template-columns:1fr}}}}
+</style></head><body><main class="shell">
+<header class="topbar"><div class="brand"><div class="logo">Q</div><div><h1>Quant Futures</h1><p>Risk kontrollü piyasa simülasyonu</p></div></div>
+<div style="display:flex;gap:8px;align-items:center"><div class="mode">SIMULATION</div><div class="{status_class}">{status}</div></div></header>
+<section class="stats">
+<div class="stat"><span>Toplam Bakiye</span><strong>&#36;{balance:.2}</strong></div>
+<div class="stat"><span>Toplam ROI</span><strong class="{roi_class}">{roi:+.2}%</strong></div>
+<div class="stat"><span>Açık PnL</span><strong class="{open_class}">&#36;{open_pnl:+.2}</strong></div>
+<div class="stat"><span>Kullanılan Marjin</span><strong>&#36;{used_margin:.2}</strong></div>
+<div class="stat"><span>Başarı Oranı</span><strong>{win_rate:.1}%</strong></div>
+<div class="stat"><span>Profit Factor</span><strong>{pf:.2}</strong></div></section>
+<div class="section-head"><h2>Açık Pozisyonlar</h2><span>{position_count} pozisyon</span></div><section class="position-grid">"#,
+        status_class = status_class,
+        status = escape_html(status_text),
+        balance = state.accounting.current_balance,
+        roi_class = roi_class,
+        roi = state.accounting.total_roi,
+        open_class = if open_pnl >= 0.0 {
+            "positive"
+        } else {
+            "negative"
+        },
+        open_pnl = open_pnl,
+        used_margin = used_margin,
+        win_rate = win_rate,
+        pf = state.stats.profit_factor,
+        position_count = state.positions.len()
+    );
+
+    if state.positions.is_empty() {
+        html.push_str(r#"<div class="empty">Henüz açık pozisyon yok.</div>"#);
+    } else {
+        for position in &state.positions {
+            let side_class = if position.side == "LONG" {
+                "long"
+            } else {
+                "short"
+            };
+            let notional = position.margin_usdt * position.leverage;
+            html.push_str(&format!(
+                r#"<article class="position {side_class}"><div class="position-top">
+<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage:.0}x kaldıraç · &#36;{notional:.2} işlem</div></div>
+<div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong>&#36;{pnl_usd:+.2}</strong><small>{pnl_percent:+.2}%</small></div></div></div>
+<div class="price-grid"><div><span>Giriş</span><b>{entry}</b></div><div><span>Anlık</span><b>{current}</b></div><div><span>Miktar</span><b>{quantity}</b></div></div>
+<div class="risk-row"><span>Marjin <b>&#36;{margin:.2}</b></span><span>Stop <b>{stop}</b></span><span>Hedef <b>{take_profit}</b></span></div></article>"#,
+                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=position.leverage,notional=notional,
+                side=escape_html(&position.side),pnl_usd=position.pnl_usd,pnl_percent=position.pnl_percent,entry=format_price(position.entry_price),
+                current=format_price(position.current_price),quantity=format_quantity(&position.quantity),margin=position.margin_usdt,
+                stop=format_price(position.stop_loss),take_profit=format_price(position.take_profit)
+            ));
+        }
+    }
+
+    html.push_str(&format!(
+        r#"</section><div class="section-head"><h2>İşlem Geçmişi</h2><span>{closed} kapanan · İşlem başı &#36;{expectancy:+.2}</span></div>
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Sonuç</th><th>PnL</th><th>PnL &#36;</th></tr></thead><tbody>"#,
+        closed=state.accounting.closed_trades_count,expectancy=state.stats.expectancy
+    ));
+    if state.history.is_empty() {
+        html.push_str(r#"<tr><td colspan="8" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
+    } else {
+        for trade in &state.history {
+            let side_class = if trade.side == "LONG" {
+                "long"
+            } else {
+                "short"
+            };
+            let pnl_class = if trade.pnl_usd >= 0.0 {
+                "positive"
+            } else {
+                "negative"
+            };
+            html.push_str(&format!(
+                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{status}</td><td class="{pnl_class}">{pnl_percent:+.2}%</td><td class="{pnl_class}">&#36;{pnl_usd:+.2}</td></tr>"#,
+                id=trade.id,symbol=escape_html(&trade.symbol),side_class=side_class,side=escape_html(&trade.side),
+                entry=format_price(trade.entry_price),exit=format_price(trade.exit_price),status=escape_html(&trade.status),
+                pnl_class=pnl_class,pnl_percent=trade.pnl_percent,pnl_usd=trade.pnl_usd
+            ));
+        }
+    }
+    html.push_str("</tbody></table></div><footer>Veriler 3 saniyede bir yenilenir · Simülasyon sonuçları gerçek piyasa performansı garantisi değildir.</footer></main></body></html>");
+    html
+}
+
 fn main() {
     dotenv().ok();
     let config = Config {
@@ -1082,91 +1232,21 @@ fn main() {
 
     for request in server.incoming_requests() {
         let state = match shared_state.lock() {
-            Ok(s) => s.clone(),
+            Ok(state) => state.clone(),
             Err(_) => continue,
         };
-        let mut html = String::from(
-            r#"<!DOCTYPE html>
-        <html lang="tr"><head><meta charset="UTF-8"><title>Quant Paneli</title><meta http-equiv="refresh" content="3">
-        <style>
-            body { background-color: #0d1117; color: #c9d1d9; font-family: Arial, sans-serif; padding: 20px; }
-            h1, h2 { color: #58a6ff; font-size: 18px; }
-            table { width: 100%; border-collapse: collapse; margin-top: 10px; background: #161b22; margin-bottom: 30px; }
-            th, td { padding: 8px; border: 1px solid #30363d; text-align: left; font-size: 12px; }
-            th { background-color: #21262d; color: #f0f6fc; }
-            .pos { color: #3fb950; font-weight: bold; }
-            .neg { color: #f85149; font-weight: bold; }
-            .err { background: #163d16; border: 1px solid #3fb950; color: #3fb950; padding: 10px; border-radius: 6px; margin-bottom: 20px; font-weight: bold; }
-            .card { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; margin-bottom: 20px; font-size: 14px; }
-        </style></head>
-        <body>
-            <h1>⚡ Quant İşlem Paneli (Simülasyon Modu)</h1>
-            <div class="err">🚨 Durum: --LAST_ERR--</div>
-            <div class="card"><b>Bakiye:</b> $--CURRENT_BAL-- | <b>ROI:</b> <span class="--ROI_CLASS--">--ROI_VAL--%</span> | <b>Kapatılan:</b> --CLOSED-- | <b>Başarılı:</b> --SUCC-- | <b>Profit Factor:</b> --PF-- | <b>Beklenti/İşlem:</b> $--EXPECTANCY-- | <b>Brüt K/Z:</b> $--GROSS_PROFIT-- / -$--GROSS_LOSS--</div>
-            <h2>Aktif Pozisyonlar</h2>
-            <table><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Lifecycle</th><th>Margin</th><th>Miktar</th><th>Giriş</th><th>Anlık</th><th>Peak PnL %</th><th>Stop Loss</th><th>Take Profit</th><th>PnL %</th><th>PnL $</th></tr>"#,
-        );
-
-        let roi_class = if state.accounting.total_roi >= 0.0 {
-            "pos"
-        } else {
-            "neg"
+        let html = render_dashboard(&state);
+        let content_type = match tiny_http::Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"text/html; charset=utf-8"[..],
+        ) {
+            Ok(header) => header,
+            Err(_) => continue,
         };
-        html = html
-            .replace("--LAST_ERR--", &state.last_error)
-            .replace(
-                "--CURRENT_BAL--",
-                &format!("{:.2}", state.accounting.current_balance),
-            )
-            .replace("--ROI_CLASS--", roi_class)
-            .replace(
-                "--ROI_VAL--",
-                &format!("{:+.2}", state.accounting.total_roi),
-            )
-            .replace(
-                "--CLOSED--",
-                &state.accounting.closed_trades_count.to_string(),
-            )
-            .replace("--SUCC--", &state.accounting.successful_trades.to_string())
-            .replace("--PF--", &format!("{:.2}", state.stats.profit_factor))
-            .replace("--EXPECTANCY--", &format!("{:+.2}", state.stats.expectancy))
-            .replace(
-                "--GROSS_PROFIT--",
-                &format!("{:.2}", state.stats.gross_profit),
-            )
-            .replace("--GROSS_LOSS--", &format!("{:.2}", state.stats.gross_loss));
-
-        if state.positions.is_empty() {
-            html.push_str("<tr><td colspan=\"13\" style=\"text-align: center;\">Aktif pozisyon yok.</td></tr>");
-        } else {
-            for p in state.positions {
-                let pnl_class = if p.pnl_percent >= 0.0 { "pos" } else { "neg" };
-                let lc_str = match p.lifecycle {
-                    PositionLifecycle::PendingOpen => {
-                        "<span style='color:orange;'>PendingOpen</span>"
-                    }
-                    PositionLifecycle::Open => "<span style='color:lightgreen;'>Open</span>",
-                    PositionLifecycle::Closed => "Closed",
-                };
-                html.push_str(&format!("<tr><td>#{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>${:.2}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"pos\">{:+.2}%</td><td class=\"neg\">{}</td><td class=\"pos\">{}</td><td class=\"{}\">{:+.2}%</td><td class=\"{}\">${:+.2}</td></tr>", p.id, p.symbol, p.side, lc_str, p.margin_usdt, format_quantity(&p.quantity), format_price(p.entry_price), format_price(p.current_price), p.peak_pnl_percent, format_price(p.stop_loss), format_price(p.take_profit), pnl_class, p.pnl_percent, pnl_class, p.pnl_usd));
-            }
+        let response = Response::from_string(html).with_header(content_type);
+        if let Err(error) = request.respond(response) {
+            eprintln!("Panel yanıtı gönderilemedi: {error}");
         }
-
-        html.push_str(r#"</table><h2>Kapatılan İşlemler (SQLite - Atomic Batch Transactions)</h2><table><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Sonuç</th><th>PnL %</th><th>PnL $</th></tr>"#);
-        if state.history.is_empty() {
-            html.push_str("<tr><td colspan=\"8\" style=\"text-align: center;\">Kapatılan işlem yok.</td></tr>");
-        } else {
-            for h in state.history {
-                let pnl_class = if h.pnl_percent >= 0.0 { "pos" } else { "neg" };
-                html.push_str(&format!("<tr><td>#{}</td><td><b>{}</b></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"{}\">{:+.2}%</td><td class=\"{}\">${:+.2}</td></tr>", h.id, h.symbol, h.side, format_price(h.entry_price), format_price(h.exit_price), h.status, pnl_class, h.pnl_percent, pnl_class, h.pnl_usd));
-            }
-        }
-        html.push_str("</table></body></html>");
-        let response = Response::from_string(html).with_header(
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-                .unwrap(),
-        );
-        let _ = request.respond(response);
     }
 }
 
