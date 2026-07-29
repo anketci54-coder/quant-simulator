@@ -1,4 +1,4 @@
-name: Format hardening branch
+name: Validate hardening branch
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  rustfmt:
+  quality:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -18,7 +18,8 @@ jobs:
           ref: agent/harden-quant-simulator
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all
       - name: Commit formatting
         run: |
@@ -29,3 +30,7 @@ jobs:
             git commit -m "format Rust sources"
             git push
           fi
+      - run: cargo fmt --all --check
+      - run: cargo check --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
