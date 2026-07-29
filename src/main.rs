@@ -118,6 +118,7 @@ enum PositionLifecycle {
     PendingOpen,
     Open,
     Closed,
+
 }
 
 #[derive(Clone)]
@@ -238,6 +239,7 @@ fn format_quantity(value: &str) -> String {
                 } else {
                     trimmed
                 }
+
             }
         })
         .unwrap_or_else(|_| value.to_string())
@@ -358,6 +360,7 @@ fn get_max_active_id(conn: &Mutex<Connection>) -> usize {
             )
             .unwrap_or(0);
         max_id as usize
+
     } else {
         0
     }
@@ -478,6 +481,7 @@ fn load_history_from_db(
                 status: row.get(5)?,
                 pnl_percent: row.get(6)?,
                 pnl_usd: row.get(7)?,
+
             })
         })
         .map_err(|e| e.to_string())?;
@@ -598,6 +602,7 @@ fn fetch_symbol_filters(
                             min_qty,
                             max_qty,
                             step_size,
+
                         },
                     );
                 }
@@ -633,7 +638,444 @@ fn calculate_obi(
     let bid_vol: f64 = depth
         .bids
         .iter()
-        .filter_map(|…5025 tokens truncated…05070b 0%,#0a1019 48%,#05070b 100%)}}
+        .filter_map(|b| b.get(1).and_then(|v| v.parse::<f64>().ok()))
+        .sum();
+    let ask_vol: f64 = depth
+        .asks
+        .iter()
+        .filter_map(|a| a.get(1).and_then(|v| v.parse::<f64>().ok()))
+        .sum();
+    if bid_vol + ask_vol > 0.0 {
+        Ok((bid_vol - ask_vol) / (bid_vol + ask_vol))
+    } else {
+        Ok(0.0)
+    }
+}
+
+fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Connection>>) {
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            if let Ok(mut state) = shared_state.lock() {
+                state.last_error = format!("HTTP istemcisi oluşturulamadı: {e}");
+            }
+            return;
+        }
+    };
+    let mut symbol_filters: HashMap<String, SymbolFilters> = HashMap::new();
+    let mut obi_samples: HashMap<String, VecDeque<f64>> = HashMap::new();
+    let mut symbol_cooldowns: HashMap<String, Instant> = HashMap::new();
+    let mut consecutive_losses = 0usize;
+    let session_starting_balance = shared_state
+        .lock()
+        .map(|state| state.accounting.current_balance)
+        .unwrap_or(0.0);
+    loop {
+        if symbol_filters.is_empty() {
+            match fetch_symbol_filters(&client, &config) {
+                Ok(filters) => symbol_filters = filters,
+                Err(e) => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        state.last_error = e;
+                    }
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            }
+        }
+        let url = config.futures_url("fapi/v1/ticker/24hr");
+        let tickers_result = client
+            .get(&url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<Vec<Ticker>>());
+        match tickers_result {
+            Ok(tickers) => {
+                let book_map: HashMap<String, BookTicker> = client
+                    .get(config.futures_url("fapi/v1/ticker/bookTicker"))
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.json::<Vec<BookTicker>>())
+                    .map(|books| {
+                        books
+                            .into_iter()
+                            .map(|book| (book.symbol.clone(), book))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut state = match shared_state.lock() {
+                    Ok(s) => s.clone(),
+                    Err(_) => {
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                let mut newly_closed = Vec::new();
+                let mut still_active = Vec::new();
+                let mut current_err =
+                    String::from("Sistem Kararlı Çalışıyor (Risk Kontrollü Simülasyon Modu)");
+                let mut batch_realized_pnl = 0.0;
+
+                for mut pos in state.positions {
+                    if pos.lifecycle == PositionLifecycle::PendingOpen {
+                        pos.lifecycle = PositionLifecycle::Open;
+
+                        pos.status = format!(
+                            "Simüle Edilmiş Emir Gerçekleşti ({}x / ${:.0}) [Gelişmiş Koruma]",
+                            pos.side, pos.margin_usdt
+                        );
+                    }
+                    if let Some(t) = tickers.iter().find(|x| x.symbol == pos.symbol) {
+                        if let Ok(curr_price) = t.last_price.parse::<f64>() {
+                            pos.current_price = curr_price;
+                            if pos.side == "LONG" {
+                                if curr_price > pos.best_price {
+                                    pos.best_price = curr_price;
+                                }
+                            } else {
+                                if curr_price < pos.best_price {
+                                    pos.best_price = curr_price;
+                                }
+                            }
+                            let Some(pnl_percent) = calculate_pnl_percent(
+                                &pos.side,
+                                pos.entry_price,
+                                curr_price,
+                                pos.leverage,
+                            ) else {
+                                still_active.push(pos);
+                                continue;
+                            };
+                            pos.pnl_percent = pnl_percent;
+                            pos.peak_pnl_percent = pos.peak_pnl_percent.max(pos.pnl_percent);
+
+                            if pos.peak_pnl_percent >= 2.5 && pos.peak_pnl_percent < 5.0 {
+                                if let Some(be_stop) = break_even_stop(&pos.side, pos.entry_price) {
+                                    if (pos.side == "LONG" && pos.stop_loss < be_stop)
+                                        || (pos.side == "SHORT" && pos.stop_loss > be_stop)
+                                    {
+                                        pos.stop_loss = be_stop;
+                                    }
+                                }
+                            } else if pos.peak_pnl_percent >= 5.0 {
+                                if pos.side == "LONG" {
+                                    let trailed_sl = pos.best_price * 0.992;
+                                    if trailed_sl > pos.stop_loss {
+                                        pos.stop_loss = trailed_sl;
+                                    }
+                                } else {
+                                    let trailed_sl = pos.best_price * 1.008;
+                                    if trailed_sl < pos.stop_loss {
+                                        pos.stop_loss = trailed_sl;
+                                    }
+                                }
+                            }
+
+                            pos.pnl_usd = pos.margin_usdt * (pos.pnl_percent / 100.0);
+                            let mut close_reason = None;
+                            if pos.side == "LONG" {
+                                if curr_price <= pos.stop_loss {
+                                    close_reason = Some("SL / Break-Even Hit".to_string());
+                                } else if curr_price >= pos.take_profit {
+                                    close_reason = Some("TP Hit".to_string());
+                                }
+                            } else {
+                                if curr_price >= pos.stop_loss {
+                                    close_reason = Some("SL / Break-Even Hit".to_string());
+                                } else if curr_price <= pos.take_profit {
+                                    close_reason = Some("TP Hit".to_string());
+                                }
+                            }
+
+                            if let Some(reason) = close_reason {
+                                pos.lifecycle = PositionLifecycle::Closed;
+                                batch_realized_pnl += pos.pnl_usd;
+                                newly_closed.push(ClosedPosition {
+                                    id: pos.id,
+                                    symbol: pos.symbol.clone(),
+                                    side: pos.side.clone(),
+                                    entry_price: pos.entry_price,
+                                    exit_price: curr_price,
+                                    status: reason,
+                                    pnl_percent: pos.pnl_percent,
+                                    pnl_usd: pos.pnl_usd,
+                                });
+                            } else {
+                                still_active.push(pos);
+                            }
+                        } else {
+                            still_active.push(pos);
+                        }
+                    } else {
+                        still_active.push(pos);
+                    }
+                }
+
+                state.accounting.current_balance += batch_realized_pnl;
+
+                let session_drawdown = if session_starting_balance > 0.0 {
+                    ((session_starting_balance - state.accounting.current_balance)
+                        / session_starting_balance)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
+                let safety_allows_entries = config.entry_enabled
+                    && session_drawdown < config.session_loss_limit
+                    && consecutive_losses < config.max_consecutive_losses;
+                if !safety_allows_entries {
+                    current_err = if !config.entry_enabled {
+                        "Yeni girişler ENTRY_ENABLED ile durduruldu".to_string()
+                    } else if consecutive_losses >= config.max_consecutive_losses {
+                        format!(
+                            "Ardışık {consecutive_losses} kayıp sonrası yeni girişler kilitlendi"
+                        )
+                    } else {
+                        format!(
+                            "Seans zarar limiti aşıldı: %{:.2}",
+                            session_drawdown * 100.0
+                        )
+                    };
+                }
+
+                if safety_allows_entries {
+                    for t in &tickers {
+
+                        if !t.symbol.ends_with("USDT") {
+                            continue;
+                        }
+                        let (Ok(change), Ok(vol), Ok(price)) = (
+                            t.price_change_percent.parse::<f64>(),
+                            t.quote_volume.parse::<f64>(),
+                            t.last_price.parse::<f64>(),
+                        ) else {
+                            continue;
+                        };
+                        if price <= 0.0 || vol < config.min_quote_volume || change.abs() <= 2.0 {
+                            continue;
+                        }
+                        let Some(book) = book_map.get(&t.symbol) else {
+                            continue;
+                        };
+                        let Some(spread) = spread_percent(book) else {
+                            continue;
+                        };
+                        if spread > config.max_spread_percent {
+                            continue;
+                        }
+                        let Ok(obi) = calculate_obi(&client, &config, &t.symbol) else {
+                            continue;
+                        };
+                        let samples = obi_samples.entry(t.symbol.clone()).or_default();
+                        samples.push_back(obi);
+                        while samples.len() > config.obi_confirmation_samples {
+                            samples.pop_front();
+                        }
+                        if samples.len() < config.obi_confirmation_samples {
+                            continue;
+                        }
+                        let long_confirmed =
+                            change > 2.0 && samples.iter().all(|value| *value >= 0.20);
+                        let short_confirmed =
+                            change < -2.0 && samples.iter().all(|value| *value <= -0.20);
+                        let (side, leverage) = if long_confirmed {
+                            ("LONG", 3.0)
+                        } else if short_confirmed {
+                            ("SHORT", 3.0)
+                        } else {
+                            continue;
+                        };
+                        let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
+                        let cooling_down = symbol_cooldowns
+                            .get(&t.symbol)
+                            .is_some_and(|closed_at| closed_at.elapsed() < config.cooldown);
+                        if already_active
+                            || cooling_down
+                            || still_active.len() >= config.max_positions
+                        {
+                            continue;
+                        }
+                        let committed_margin: f64 = still_active
+                            .iter()
+                            .map(|position| position.margin_usdt)
+                            .sum();
+                        let free_margin = state.accounting.current_balance - committed_margin;
+                        if free_margin <= 0.0 {
+                            continue;
+                        }
+                        let (stop_loss, take_profit) = if side == "LONG" {
+                            (price * 0.985, price * 1.035)
+                        } else {
+                            (price * 1.015, price * 0.965)
+                        };
+                        let Some(filters) = symbol_filters.get(&t.symbol) else {
+                            continue;
+                        };
+                        let Some((quantity, margin_usdt, new_risk)) = calculate_position_size(
+                            state.accounting.current_balance,
+                            price,
+                            stop_loss,
+                            leverage,
+                            config.risk_per_trade,
+                            filters,
+                        ) else {
+                            continue;
+                        };
+                        let portfolio_risk: f64 = still_active.iter().map(position_risk).sum();
+                        let max_risk_usd =
+                            state.accounting.current_balance * config.max_portfolio_risk;
+                        if portfolio_risk + new_risk > max_risk_usd || margin_usdt > free_margin {
+                            continue;
+                        }
+                        let precision = filters
+                            .step_size
+                            .to_string()
+                            .split('.')
+                            .nth(1)
+                            .map_or(0, |value| value.trim_end_matches('0').len());
+                        let quantity_text = format!("{:.*}", precision, quantity);
+                        let current_id = state.next_position_id;
+                        state.next_position_id += 1;
+                        still_active.push(ActivePosition {
+                            id: current_id,
+                            symbol: t.symbol.clone(),
+                            side: side.to_string(),
+                            entry_price: price,
+                            current_price: price,
+                            stop_loss,
+                            take_profit,
+                            best_price: price,
+                            peak_pnl_percent: -FEE_RATE_PERCENT * leverage,
+                            leverage,
+                            margin_usdt,
+                            lifecycle: PositionLifecycle::PendingOpen,
+                            status: format!(
+                                "Risk kontrollü simüle emir: {} / risk USD {:.2}",
+                                side, new_risk
+                            ),
+                            pnl_percent: -FEE_RATE_PERCENT * leverage,
+                            pnl_usd: -(margin_usdt * FEE_RATE_PERCENT * leverage / 100.0),
+                            quantity: quantity_text,
+                        });
+                    }
+                }
+
+                if state.accounting.starting_balance > 0.0 {
+
+                    state.accounting.total_roi = ((state.accounting.current_balance
+                        - state.accounting.starting_balance)
+                        / state.accounting.starting_balance)
+                        * 100.0;
+                }
+
+                if let Err(e) =
+                    atomic_batch_save(&db_conn, &newly_closed, &still_active, &state.accounting)
+                {
+                    if let Ok(mut locked_state) = shared_state.lock() {
+                        locked_state.last_error =
+                            format!("DB Batch Transaction Hatası: {e}; durum ilerletilmedi");
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+
+                for closed in &newly_closed {
+                    symbol_cooldowns.insert(closed.symbol.clone(), Instant::now());
+                    if closed.pnl_usd < 0.0 {
+                        consecutive_losses += 1;
+                    } else {
+                        consecutive_losses = 0;
+                    }
+                }
+
+                state.positions = still_active;
+
+                if let Ok((hist, tot_count, succ_count)) = load_history_from_db(&db_conn) {
+                    state.history = hist;
+                    state.accounting.closed_trades_count = tot_count;
+                    state.accounting.successful_trades = succ_count;
+                }
+                if let Ok(stats) = load_performance_stats(&db_conn) {
+                    state.stats = stats;
+                }
+
+                state.last_error = current_err;
+                if let Ok(mut locked_state) = shared_state.lock() {
+                    *locked_state = state;
+                }
+            }
+            Err(e) => {
+                if let Ok(mut state) = shared_state.lock() {
+                    state.last_error = format!("Ağ Hatası: {}", e);
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn render_dashboard(state: &AppState) -> String {
+    let roi_class = if state.accounting.total_roi >= 0.0 {
+        "positive"
+    } else {
+        "negative"
+    };
+    let win_rate = if state.accounting.closed_trades_count > 0 {
+        state.accounting.successful_trades as f64 / state.accounting.closed_trades_count as f64
+            * 100.0
+    } else {
+        0.0
+    };
+    let used_margin: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.margin_usdt)
+        .sum();
+    let open_pnl: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.pnl_usd)
+        .sum();
+    let status_text = if state.last_error.contains("ENTRY_ENABLED") {
+        "Yeni işlemler kapalı"
+    } else {
+        &state.last_error
+    };
+    let status_class = if state.last_error.contains("Hata") {
+        "status danger"
+    } else if state.last_error.contains("ENTRY_ENABLED") {
+        "status warning"
+    } else {
+        "status healthy"
+    };
+    let balance_text = format_money(state.accounting.current_balance, false);
+    let roi_text = format_percent(state.accounting.total_roi, 2, true);
+    let open_pnl_text = format_money(open_pnl, true);
+    let used_margin_text = format_money(used_margin, false);
+    let win_rate_text = format_percent(win_rate, 1, false);
+    let profit_factor_text = format_tr_number(state.stats.profit_factor, 2, false);
+
+    let mut html = format!(
+        r#"<!doctype html>
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="3"><title>Quant Futures</title>
+<style>
+:root{{--bg:#05070b;--glass:#111722d9;--glass2:#171f2d;--line:#293346;--text:#f4f7fb;--muted:#8290a7;--gold:#f8c246;--green:#14e6a0;--red:#ff4d6d;--blue:#5ba8ff}}
+*{{box-sizing:border-box}}html{{min-height:100%}}body{{margin:0;min-height:100vh;background:#05070b;color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;overflow-x:hidden}}
+body:before{{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(circle at 8% 0%,#17315970 0,transparent 32%),radial-gradient(circle at 92% 8%,#5b421f54 0,transparent 28%),linear-gradient(145deg,#05070b 0%,#0a1019 48%,#05070b 100%)}}
 body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-image:linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px);background-size:42px 42px;mask-image:linear-gradient(to bottom,#000,transparent 78%)}}
 .shell{{max-width:1540px;margin:auto;padding:28px 30px 44px;perspective:1400px}}.topbar{{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:24px;padding:14px 16px;border:1px solid #ffffff12;border-radius:18px;background:linear-gradient(135deg,#131a26dc,#090d14c7);box-shadow:0 18px 55px #0008,inset 0 1px #ffffff10;backdrop-filter:blur(18px)}}
 .brand{{display:flex;align-items:center;gap:14px}}.logo{{position:relative;width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,#ffe27a,#e7a900);color:#111;display:grid;place-items:center;font-weight:950;font-size:21px;box-shadow:0 12px 24px #0008,0 0 28px #f8c24638,inset 0 2px 2px #fff9,inset 0 -3px 5px #9e680077;transform:rotate(-3deg)}}
@@ -644,6 +1086,7 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
 .stats{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:14px;margin-bottom:30px}}.stat{{position:relative;overflow:hidden;background:linear-gradient(145deg,#192231e8,#0d131de8);border:1px solid #ffffff13;border-radius:16px;padding:17px 16px 18px;box-shadow:0 16px 32px #0007,inset 0 1px #ffffff10;transform:translateZ(0);transition:.25s ease}}
 .stat:before{{content:"";position:absolute;inset:0;background:linear-gradient(115deg,#ffffff0d,transparent 34%);pointer-events:none}}.stat:after{{content:"";position:absolute;left:15px;right:15px;bottom:0;height:2px;background:linear-gradient(90deg,transparent,var(--blue),transparent);opacity:.55}}.stat:hover{{transform:translateY(-5px) rotateX(3deg);border-color:#5ba8ff55;box-shadow:0 24px 42px #0009,0 0 22px #5ba8ff18,inset 0 1px #ffffff18}}
 .stat span{{display:block;color:#8696ad;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}}.stat strong{{font-size:20px;font-variant-numeric:tabular-nums;text-shadow:0 2px 14px #000}}
+
 .positive{{color:var(--green)!important;text-shadow:0 0 18px #14e6a033!important}}.negative{{color:var(--red)!important;text-shadow:0 0 18px #ff4d6d33!important}}.section-head{{display:flex;align-items:end;justify-content:space-between;margin:24px 2px 13px}}.section-head h2{{font-size:16px;margin:0;letter-spacing:.2px}}.section-head h2:after{{content:"";display:block;width:42px;height:3px;margin-top:8px;border-radius:3px;background:linear-gradient(90deg,var(--gold),transparent);box-shadow:0 0 12px #f8c24655}}.section-head span{{font-size:11px;color:var(--muted)}}
 .position-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:16px}}.position{{position:relative;overflow:hidden;background:linear-gradient(145deg,#182230f2,#0b111af2);border:1px solid #ffffff14;border-radius:18px;padding:19px;box-shadow:0 20px 38px #0009,inset 0 1px #ffffff12;transform-style:preserve-3d;transition:.25s ease}}
 .position:before{{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 90% 0%,var(--glow),transparent 40%),linear-gradient(115deg,#ffffff0c,transparent 35%)}}.position:after{{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;background:linear-gradient(90deg,transparent,var(--accent),transparent);box-shadow:0 0 18px var(--accent)}}.position:hover{{transform:translateY(-6px) rotateX(2deg) rotateY(-1deg);box-shadow:0 30px 50px #000b,0 0 28px var(--glow),inset 0 1px #ffffff18}}.position.long{{--accent:var(--green);--glow:#14e6a018;border-color:#14e6a044}}.position.short{{--accent:var(--red);--glow:#ff4d6d18;border-color:#ff4d6d44}}
@@ -764,6 +1207,7 @@ fn main() {
         session_loss_limit: env::var("SESSION_LOSS_LIMIT")
             .ok()
             .and_then(|value| value.parse().ok())
+
             .unwrap_or(0.02),
         max_consecutive_losses: env::var("MAX_CONSECUTIVE_LOSSES")
             .ok()
@@ -884,6 +1328,7 @@ mod tests {
     fn quantity_respects_exchange_filters() {
         let filters = SymbolFilters {
             min_qty: 0.001,
+
             max_qty: 100.0,
             step_size: 0.001,
         };
@@ -933,4 +1378,3 @@ mod tests {
         assert_eq!(format_percent(12.5, 2, true), "+12,50%");
     }
 }
-
