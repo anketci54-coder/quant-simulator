@@ -224,6 +224,14 @@ struct DailyAccounting {
     successful_trades: usize,
 }
 
+#[derive(Clone, Default)]
+struct PerformanceStats {
+    gross_profit: f64,
+    gross_loss: f64,
+    profit_factor: f64,
+    expectancy: f64,
+}
+
 #[derive(Clone)]
 struct AppState {
     positions: Vec<ActivePosition>,
@@ -231,6 +239,7 @@ struct AppState {
     accounting: DailyAccounting,
     next_position_id: usize,
     last_error: String,
+    stats: PerformanceStats,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -408,6 +417,35 @@ fn load_history_from_db(
     }
     history.reverse();
     Ok((history, total_count, successful_count))
+}
+
+fn load_performance_stats(conn: &Mutex<Connection>) -> Result<PerformanceStats, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let (gross_profit, gross_loss, trade_count): (f64, f64, i64) = c
+        .query_row(
+            "SELECT COALESCE(SUM(CASE WHEN pnl_usd > 0 THEN pnl_usd ELSE 0 END), 0.0), COALESCE(SUM(CASE WHEN pnl_usd < 0 THEN -pnl_usd ELSE 0 END), 0.0), COUNT(*) FROM closed_trades",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let profit_factor = if gross_loss > 0.0 {
+        gross_profit / gross_loss
+    } else if gross_profit > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    let expectancy = if trade_count > 0 {
+        (gross_profit - gross_loss) / trade_count as f64
+    } else {
+        0.0
+    };
+    Ok(PerformanceStats {
+        gross_profit,
+        gross_loss,
+        profit_factor,
+        expectancy,
+    })
 }
 
 fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> DailyAccounting {
@@ -885,6 +923,9 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     state.accounting.closed_trades_count = tot_count;
                     state.accounting.successful_trades = succ_count;
                 }
+                if let Ok(stats) = load_performance_stats(&db_conn) {
+                    state.stats = stats;
+                }
 
                 state.last_error = current_err;
                 if let Ok(mut locked_state) = shared_state.lock() {
@@ -962,6 +1003,7 @@ fn main() {
     let (initial_history, total_closed, total_succ) =
         load_history_from_db(&db_conn).unwrap_or_default();
     let initial_accounting = load_accounting_from_db(&db_conn, 1000.0);
+    let initial_stats = load_performance_stats(&db_conn).unwrap_or_default();
 
     let shared_state: SharedState = Arc::new(Mutex::new(AppState {
         positions: initial_positions,
@@ -976,6 +1018,7 @@ fn main() {
         },
         next_position_id: next_id,
         last_error: "Sistem Başlatıldı".to_string(),
+        stats: initial_stats,
     }));
 
     let s_clone = Arc::clone(&shared_state);
@@ -1017,7 +1060,7 @@ fn main() {
         <body>
             <h1>⚡ Quant İşlem Paneli (Simülasyon Modu)</h1>
             <div class="err">🚨 Durum: --LAST_ERR--</div>
-            <div class="card"><b>Bakiye:</b> $--CURRENT_BAL-- | <b>ROI:</b> <span class="--ROI_CLASS--">--ROI_VAL--%</span> | <b>Kapatılan:</b> --CLOSED-- | <b>Başarılı:</b> --SUCC--</div>
+            <div class="card"><b>Bakiye:</b> $--CURRENT_BAL-- | <b>ROI:</b> <span class="--ROI_CLASS--">--ROI_VAL--%</span> | <b>Kapatılan:</b> --CLOSED-- | <b>Başarılı:</b> --SUCC-- | <b>Profit Factor:</b> --PF-- | <b>Beklenti/İşlem:</b> $--EXPECTANCY-- | <b>Brüt K/Z:</b> $--GROSS_PROFIT-- / -$--GROSS_LOSS--</div>
             <h2>Aktif Pozisyonlar</h2>
             <table><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Lifecycle</th><th>Margin</th><th>Miktar</th><th>Giriş</th><th>Anlık</th><th>Peak PnL %</th><th>Stop Loss</th><th>Take Profit</th><th>PnL %</th><th>PnL $</th></tr>"#,
         );
@@ -1042,7 +1085,11 @@ fn main() {
                 "--CLOSED--",
                 &state.accounting.closed_trades_count.to_string(),
             )
-            .replace("--SUCC--", &state.accounting.successful_trades.to_string());
+            .replace("--SUCC--", &state.accounting.successful_trades.to_string())
+            .replace("--PF--", &format!("{:.2}", state.stats.profit_factor))
+            .replace("--EXPECTANCY--", &format!("{:+.2}", state.stats.expectancy))
+            .replace("--GROSS_PROFIT--", &format!("{:.2}", state.stats.gross_profit))
+            .replace("--GROSS_LOSS--", &format!("{:.2}", state.stats.gross_loss));
 
         if state.positions.is_empty() {
             html.push_str("<tr><td colspan=\"13\" style=\"text-align: center;\">Aktif pozisyon yok.</td></tr>");
