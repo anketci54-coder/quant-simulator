@@ -263,8 +263,6 @@ struct DailyAccounting {
 
 #[derive(Clone, Default)]
 struct PerformanceStats {
-    gross_profit: f64,
-    gross_loss: f64,
     profit_factor: f64,
     expectancy: f64,
 }
@@ -478,8 +476,6 @@ fn load_performance_stats(conn: &Mutex<Connection>) -> Result<PerformanceStats, 
         0.0
     };
     Ok(PerformanceStats {
-        gross_profit,
-        gross_loss,
         profit_factor,
         expectancy,
     })
