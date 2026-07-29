@@ -5,10 +5,82 @@ use std::time::Duration;
 use tiny_http::{Server, Response};
 use dotenvy::dotenv;
 use std::env;
+use std::collections::HashMap;
 use rusqlite::{Connection, params};
 
 const MAX_POSITIONS: usize = 10;
 const POSITION_MARGIN_USDT: f64 = 100.0;
+const FEE_RATE_PERCENT: f64 = 0.04;
+const BREAKEVEN_BUFFER_RATE: f64 = 0.001;
+
+#[derive(Clone, Debug)]
+struct SymbolFilters {
+    min_qty: f64,
+    max_qty: f64,
+    step_size: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExchangeInfo {
+    symbols: Vec<ExchangeSymbol>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ExchangeSymbol {
+    symbol: String,
+    filters: Vec<ExchangeFilter>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "filterType")]
+enum ExchangeFilter {
+    #[serde(rename = "LOT_SIZE")]
+    LotSize {
+        #[serde(rename = "minQty")]
+        min_qty: String,
+        #[serde(rename = "maxQty")]
+        max_qty: String,
+        #[serde(rename = "stepSize")]
+        step_size: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+fn calculate_pnl_percent(side: &str, entry: f64, current: f64, leverage: f64) -> Option<f64> {
+    if entry <= 0.0 || current <= 0.0 || leverage <= 0.0 {
+        return None;
+    }
+    let raw_diff = if side == "LONG" {
+        (current - entry) / entry
+    } else if side == "SHORT" {
+        (entry - current) / entry
+    } else {
+        return None;
+    };
+    Some((raw_diff * leverage * 100.0) - (FEE_RATE_PERCENT * leverage * 2.0))
+}
+
+fn break_even_stop(side: &str, entry: f64) -> Option<f64> {
+    match side {
+        "LONG" => Some(entry * (1.0 + BREAKEVEN_BUFFER_RATE)),
+        "SHORT" => Some(entry * (1.0 - BREAKEVEN_BUFFER_RATE)),
+        _ => None,
+    }
+}
+
+fn quantize_quantity(raw_qty: f64, filters: &SymbolFilters) -> Option<f64> {
+    if !raw_qty.is_finite() || raw_qty <= 0.0 || filters.step_size <= 0.0 {
+        return None;
+    }
+    let qty = (raw_qty / filters.step_size).floor() * filters.step_size;
+    if qty + f64::EPSILON < filters.min_qty || qty > filters.max_qty {
+        None
+    } else {
+        Some(qty)
+    }
+}
+
 
 #[derive(Clone, Serialize, Debug, PartialEq)]
 enum PositionLifecycle {
@@ -230,20 +302,85 @@ fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> D
     DailyAccounting { date: "2026-07-28".to_string(), starting_balance: starting, current_balance: current, total_roi, closed_trades_count: 0, successful_trades: 0 }
 }
 
+fn fetch_symbol_filters(client: &reqwest::blocking::Client, config: &Config) -> Result<HashMap<String, SymbolFilters>, String> {
+    let url = config.futures_url("fapi/v1/exchangeInfo");
+    let info = client
+        .get(&url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("exchangeInfo request failed: {e}"))?
+        .json::<ExchangeInfo>()
+        .map_err(|e| format!("exchangeInfo parse failed: {e}"))?;
+
+    let mut result = HashMap::new();
+    for symbol in info.symbols {
+        for filter in symbol.filters {
+            if let ExchangeFilter::LotSize { min_qty, max_qty, step_size } = filter {
+                if let (Ok(min_qty), Ok(max_qty), Ok(step_size)) = (
+                    min_qty.parse::<f64>(),
+                    max_qty.parse::<f64>(),
+                    step_size.parse::<f64>(),
+                ) {
+                    result.insert(symbol.symbol.clone(), SymbolFilters { min_qty, max_qty, step_size });
+                }
+                break;
+            }
+        }
+    }
+    if result.is_empty() {
+        Err("exchangeInfo returned no usable LOT_SIZE filters".to_string())
+    } else {
+        Ok(result)
+    }
+}
+
 fn calculate_obi(client: &reqwest::blocking::Client, config: &Config, symbol: &str) -> Result<f64, String> {
     let url = format!("{}?symbol={}&limit=5", config.futures_url("fapi/v1/depth"), symbol);
-    let resp = client.get(&url).send().map_err(|e| e.to_string())?;
-    let depth = resp.json::<Depth>().map_err(|e| e.to_string())?;
+    let resp = client
+        .get(&url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("depth request failed for {symbol}: {e}"))?;
+    let depth = resp.json::<Depth>().map_err(|e| format!("depth parse failed for {symbol}: {e}"))?;
     let bid_vol: f64 = depth.bids.iter().filter_map(|b| b.get(1).and_then(|v| v.parse::<f64>().ok())).sum();
     let ask_vol: f64 = depth.asks.iter().filter_map(|a| a.get(1).and_then(|v| v.parse::<f64>().ok())).sum();
     if bid_vol + ask_vol > 0.0 { Ok((bid_vol - ask_vol) / (bid_vol + ask_vol)) } else { Ok(0.0) }
 }
 
 fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Connection>>) {
-    let client = reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(3)).timeout(Duration::from_secs(10)).build().unwrap();
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            if let Ok(mut state) = shared_state.lock() {
+                state.last_error = format!("HTTP istemcisi oluşturulamadı: {e}");
+            }
+            return;
+        }
+    };
+    let mut symbol_filters: HashMap<String, SymbolFilters> = HashMap::new();
     loop {
+        if symbol_filters.is_empty() {
+            match fetch_symbol_filters(&client, &config) {
+                Ok(filters) => symbol_filters = filters,
+                Err(e) => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        state.last_error = e;
+                    }
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            }
+        }
         let url = config.futures_url("fapi/v1/ticker/24hr");
-        let tickers_result = client.get(&url).send().and_then(|r| r.json::<Vec<Ticker>>());
+        let tickers_result = client
+            .get(&url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<Vec<Ticker>>());
         match tickers_result {
             Ok(tickers) => {
                 let mut state = match shared_state.lock() { Ok(s) => s.clone(), Err(_) => { thread::sleep(Duration::from_secs(1)); continue; } };
@@ -262,14 +399,18 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             pos.current_price = curr_price;
                             if pos.side == "LONG" { if curr_price > pos.best_price { pos.best_price = curr_price; } }
                             else { if curr_price < pos.best_price { pos.best_price = curr_price; } }
-                            let raw_diff = if pos.side == "LONG" { (curr_price - pos.entry_price) / pos.entry_price } else { (pos.entry_price - curr_price) / pos.entry_price };
-                            let fee_roi = 0.04 * pos.leverage * 2.0;
-                            pos.pnl_percent = (raw_diff * pos.leverage * 100.0) - fee_roi;
+                            let Some(pnl_percent) = calculate_pnl_percent(&pos.side, pos.entry_price, curr_price, pos.leverage) else {
+                                still_active.push(pos);
+                                continue;
+                            };
+                            pos.pnl_percent = pnl_percent;
                             pos.peak_pnl_percent = pos.peak_pnl_percent.max(pos.pnl_percent);
 
                             if pos.peak_pnl_percent >= 2.5 && pos.peak_pnl_percent < 5.0 {
-                                if pos.side == "LONG" && pos.stop_loss < pos.entry_price { pos.stop_loss = pos.entry_price; }
-                                else if pos.side == "SHORT" && pos.stop_loss > pos.entry_price { pos.stop_loss = pos.entry_price; }
+                                if let Some(be_stop) = break_even_stop(&pos.side, pos.entry_price) {
+                                    if pos.side == "LONG" && pos.stop_loss < be_stop { pos.stop_loss = be_stop; }
+                                    else if pos.side == "SHORT" && pos.stop_loss > be_stop { pos.stop_loss = be_stop; }
+                                }
                             } else if pos.peak_pnl_percent >= 5.0 {
                                 if pos.side == "LONG" {
                                     let trailed_sl = pos.best_price * 0.992;
@@ -320,9 +461,10 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                             let price = t.last_price.parse::<f64>().unwrap_or(0.0);
                                             if price > 0.0 {
                                                 let raw_qty = (POSITION_MARGIN_USDT * lev) / price;
-                                                let step_size = 0.001;
-                                                let stepped_qty = (raw_qty / step_size).floor() * step_size;
-                                                let qty_str = format!("{:.3}", stepped_qty.max(step_size));
+                                                let Some(filters) = symbol_filters.get(&t.symbol) else { continue; };
+                                                let Some(stepped_qty) = quantize_quantity(raw_qty, filters) else { continue; };
+                                                let precision = filters.step_size.to_string().split('.').nth(1).map_or(0, |v| v.trim_end_matches('0').len());
+                                                let qty_str = format!("{:.*}", precision, stepped_qty);
                                                 let (stop_loss, take_profit) = if side == "LONG" { (price * 0.985, price * 1.035) } else { (price * 1.015, price * 0.965) };
                                                 let current_id = state.next_position_id;
                                                 state.next_position_id += 1;
@@ -345,7 +487,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 if let Err(e) = atomic_batch_save(&db_conn, &newly_closed, &still_active, &state.accounting) {
-                    current_err = format!("DB Batch Transaction Hatası: {}", e);
+                    if let Ok(mut locked_state) = shared_state.lock() {
+                        locked_state.last_error = format!("DB Batch Transaction Hatası: {e}; durum ilerletilmedi");
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
                 }
 
                 state.positions = still_active;
@@ -449,5 +595,32 @@ fn main() {
         html.push_str("</table></body></html>");
         let response = Response::from_string(html).with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap());
         let _ = request.respond(response);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pnl_is_symmetric_for_long_and_short() {
+        let long = calculate_pnl_percent("LONG", 100.0, 101.0, 3.0).unwrap();
+        let short = calculate_pnl_percent("SHORT", 100.0, 99.0, 3.0).unwrap();
+        assert!((long - short).abs() < 1e-9);
+        assert!((long - 2.76).abs() < 1e-9);
+    }
+
+    #[test]
+    fn break_even_covers_fee_and_slippage_buffer() {
+        assert!(break_even_stop("LONG", 100.0).unwrap() > 100.0);
+        assert!(break_even_stop("SHORT", 100.0).unwrap() < 100.0);
+    }
+
+    #[test]
+    fn quantity_respects_exchange_filters() {
+        let filters = SymbolFilters { min_qty: 0.001, max_qty: 100.0, step_size: 0.001 };
+        assert_eq!(quantize_quantity(1.23456, &filters), Some(1.234));
+        assert_eq!(quantize_quantity(0.0005, &filters), None);
     }
 }
