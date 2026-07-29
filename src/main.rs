@@ -171,6 +171,41 @@ struct BookTicker {
     ask_price: String,
 }
 
+fn format_tr_number(value: f64, precision: usize, show_plus: bool) -> String {
+    if !value.is_finite() {
+        return "—".to_string();
+    }
+    let sign = if value < 0.0 {
+        "-"
+    } else if show_plus && value > 0.0 {
+        "+"
+    } else {
+        ""
+    };
+    let raw = format!("{:.*}", precision, value.abs());
+    let (integer, decimals) = raw.split_once('.').unwrap_or((&raw, ""));
+    let mut grouped = String::with_capacity(integer.len() + integer.len() / 3);
+    for (index, character) in integer.chars().enumerate() {
+        if index > 0 && (integer.len() - index) % 3 == 0 {
+            grouped.push('.');
+        }
+        grouped.push(character);
+    }
+    if precision == 0 {
+        format!("{sign}{grouped}")
+    } else {
+        format!("{sign}{grouped},{decimals}")
+    }
+}
+
+fn format_money(value: f64, show_plus: bool) -> String {
+    format_tr_number(value, 2, show_plus)
+}
+
+fn format_percent(value: f64, precision: usize, show_plus: bool) -> String {
+    format!("{}%", format_tr_number(value, precision, show_plus))
+}
+
 fn format_price(value: f64) -> String {
     let precision = if value.abs() >= 1_000.0 {
         2
@@ -183,7 +218,7 @@ fn format_price(value: f64) -> String {
     };
     let scale = 10_f64.powi(precision as i32);
     let rounded = (value * scale).round() / scale;
-    format!("{rounded:.precision$}")
+    format_tr_number(rounded, precision, false)
 }
 
 fn format_quantity(value: &str) -> String {
@@ -192,11 +227,11 @@ fn format_quantity(value: &str) -> String {
         .map(|parsed| {
             if parsed.abs() >= 1_000.0 {
                 let rounded = (parsed * 100.0).round() / 100.0;
-                format!("{rounded:.2}")
+                format_tr_number(rounded, 2, false)
             } else {
-                let trimmed = format!("{parsed:.8}")
+                let trimmed = format_tr_number(parsed, 8, false)
                     .trim_end_matches('0')
-                    .trim_end_matches('.')
+                    .trim_end_matches(',')
                     .to_string();
                 if trimmed.is_empty() {
                     "0".to_string()
@@ -683,6 +718,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 for mut pos in state.positions {
                     if pos.lifecycle == PositionLifecycle::PendingOpen {
                         pos.lifecycle = PositionLifecycle::Open;
+
                         pos.status = format!(
                             "Simüle Edilmiş Emir Gerçekleşti ({}x / ${:.0}) [Gelişmiş Koruma]",
                             pos.side, pos.margin_usdt
@@ -1018,59 +1054,66 @@ fn render_dashboard(state: &AppState) -> String {
     } else {
         "status healthy"
     };
+    let balance_text = format_money(state.accounting.current_balance, false);
+    let roi_text = format_percent(state.accounting.total_roi, 2, true);
+    let open_pnl_text = format_money(open_pnl, true);
+    let used_margin_text = format_money(used_margin, false);
+    let win_rate_text = format_percent(win_rate, 1, false);
+    let profit_factor_text = format_tr_number(state.stats.profit_factor, 2, false);
 
     let mut html = format!(
         r#"<!doctype html>
 <html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="3"><title>Quant Futures</title>
 <style>
-:root{{--bg:#0b0e11;--panel:#12161c;--panel2:#181d25;--line:#2a3039;--text:#eaecef;--muted:#848e9c;--gold:#f0b90b;--green:#0ecb81;--red:#f6465d}}
-*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at top right,#181b15 0,#0b0e11 35%);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}}
-.shell{{max-width:1500px;margin:auto;padding:24px}}.topbar{{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:20px}}
-.brand{{display:flex;align-items:center;gap:12px}}.logo{{width:38px;height:38px;border-radius:10px;background:var(--gold);color:#111;display:grid;place-items:center;font-weight:900;font-size:19px;box-shadow:0 0 24px #f0b90b2b}}
-.brand h1{{font-size:20px;margin:0;letter-spacing:.2px}}.brand p{{margin:3px 0 0;color:var(--muted);font-size:12px}}
-.mode{{font-size:11px;color:#111;background:var(--gold);font-weight:800;padding:6px 10px;border-radius:6px;letter-spacing:.7px}}
-.status{{display:flex;align-items:center;gap:8px;padding:10px 13px;border:1px solid var(--line);background:var(--panel);border-radius:9px;color:var(--muted);font-size:13px}}
-.status:before{{content:"";width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}}.status.warning:before{{background:var(--gold);box-shadow:0 0 10px var(--gold)}}.status.danger:before{{background:var(--red);box-shadow:0 0 10px var(--red)}}
-.stats{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:10px;margin-bottom:24px}}.stat{{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:10px;padding:14px}}
-.stat span{{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.65px;margin-bottom:7px}}.stat strong{{font-size:19px;font-variant-numeric:tabular-nums}}
-.positive{{color:var(--green)!important}}.negative{{color:var(--red)!important}}.section-head{{display:flex;align-items:end;justify-content:space-between;margin:20px 0 12px}}.section-head h2{{font-size:16px;margin:0}}.section-head span{{font-size:12px;color:var(--muted)}}
-.position-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px}}.position{{position:relative;overflow:hidden;background:linear-gradient(145deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:12px;padding:16px}}
-.position:before{{content:"";position:absolute;left:0;top:0;bottom:0;width:4px}}.position.long{{border-color:#0ecb8142}}.position.long:before{{background:var(--green)}}.position.short{{border-color:#f6465d42}}.position.short:before{{background:var(--red)}}
-.position-top{{display:flex;justify-content:space-between;align-items:start;margin-bottom:17px}}.symbol{{font-size:18px;font-weight:800}}.side{{font-size:11px;font-weight:900;padding:5px 9px;border-radius:5px}}
-.long .side{{color:var(--green);background:#0ecb8119}}.short .side{{color:var(--red);background:#f6465d19}}.position-meta{{color:var(--muted);font-size:11px;margin-top:4px}}
-.pnl{{text-align:right}}.pnl strong{{display:block;font-size:22px;font-variant-numeric:tabular-nums}}.pnl small{{color:var(--muted)}}.long .pnl strong{{color:var(--green)}}.short .pnl strong{{color:var(--red)}}
-.price-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);padding-top:13px}}.price-grid span{{color:var(--muted);font-size:10px;display:block;margin-bottom:4px}}.price-grid b{{font-size:13px;font-variant-numeric:tabular-nums}}
-.risk-row{{display:flex;justify-content:space-between;margin-top:13px;padding-top:11px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}}.risk-row b{{color:var(--text)}}
-.empty{{background:var(--panel);border:1px dashed var(--line);border-radius:12px;padding:38px;text-align:center;color:var(--muted)}}.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:12px;background:var(--panel)}}
-table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);text-align:left;background:var(--panel2)}}th,td{{padding:12px 14px;border-bottom:1px solid var(--line)}}td{{font-size:12px;font-variant-numeric:tabular-nums}}tr:last-child td{{border-bottom:0}}
-.side-text.long{{color:var(--green);font-weight:800}}.side-text.short{{color:var(--red);font-weight:800}}footer{{color:var(--muted);font-size:10px;text-align:center;margin-top:22px}}
-@media(max-width:1000px){{.stats{{grid-template-columns:repeat(3,1fr)}}}}@media(max-width:650px){{.shell{{padding:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.stats{{grid-template-columns:repeat(2,1fr)}}.position-grid{{grid-template-columns:1fr}}}}
+:root{{--bg:#05070b;--glass:#111722d9;--glass2:#171f2d;--line:#293346;--text:#f4f7fb;--muted:#8290a7;--gold:#f8c246;--green:#14e6a0;--red:#ff4d6d;--blue:#5ba8ff}}
+*{{box-sizing:border-box}}html{{min-height:100%}}body{{margin:0;min-height:100vh;background:#05070b;color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;overflow-x:hidden}}
+body:before{{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(circle at 8% 0%,#17315970 0,transparent 32%),radial-gradient(circle at 92% 8%,#5b421f54 0,transparent 28%),linear-gradient(145deg,#05070b 0%,#0a1019 48%,#05070b 100%)}}
+body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-image:linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px);background-size:42px 42px;mask-image:linear-gradient(to bottom,#000,transparent 78%)}}
+.shell{{max-width:1540px;margin:auto;padding:28px 30px 44px;perspective:1400px}}.topbar{{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:24px;padding:14px 16px;border:1px solid #ffffff12;border-radius:18px;background:linear-gradient(135deg,#131a26dc,#090d14c7);box-shadow:0 18px 55px #0008,inset 0 1px #ffffff10;backdrop-filter:blur(18px)}}
+.brand{{display:flex;align-items:center;gap:14px}}.logo{{position:relative;width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,#ffe27a,#e7a900);color:#111;display:grid;place-items:center;font-weight:950;font-size:21px;box-shadow:0 12px 24px #0008,0 0 28px #f8c24638,inset 0 2px 2px #fff9,inset 0 -3px 5px #9e680077;transform:rotate(-3deg)}}
+.brand h1{{font-size:21px;margin:0;letter-spacing:.25px;text-shadow:0 2px 16px #000}}.brand p{{margin:4px 0 0;color:var(--muted);font-size:12px}}.top-actions{{display:flex;gap:10px;align-items:center}}
+.mode{{font-size:10px;color:#161000;background:linear-gradient(180deg,#ffd966,#e9aa08);font-weight:900;padding:8px 12px;border-radius:9px;letter-spacing:1px;box-shadow:0 7px 16px #0007,inset 0 1px #fff8}}
+.status{{display:flex;align-items:center;gap:9px;padding:11px 14px;border:1px solid #ffffff12;background:#0b111bd9;border-radius:11px;color:#9eabc0;font-size:12px;box-shadow:inset 0 1px #ffffff08,0 8px 20px #0005}}
+.status:before{{content:"";width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green),0 0 18px var(--green)}}.status.warning:before{{background:var(--gold);box-shadow:0 0 8px var(--gold),0 0 18px var(--gold)}}.status.danger:before{{background:var(--red);box-shadow:0 0 8px var(--red),0 0 18px var(--red)}}
+.stats{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:14px;margin-bottom:30px}}.stat{{position:relative;overflow:hidden;background:linear-gradient(145deg,#192231e8,#0d131de8);border:1px solid #ffffff13;border-radius:16px;padding:17px 16px 18px;box-shadow:0 16px 32px #0007,inset 0 1px #ffffff10;transform:translateZ(0);transition:.25s ease}}
+.stat:before{{content:"";position:absolute;inset:0;background:linear-gradient(115deg,#ffffff0d,transparent 34%);pointer-events:none}}.stat:after{{content:"";position:absolute;left:15px;right:15px;bottom:0;height:2px;background:linear-gradient(90deg,transparent,var(--blue),transparent);opacity:.55}}.stat:hover{{transform:translateY(-5px) rotateX(3deg);border-color:#5ba8ff55;box-shadow:0 24px 42px #0009,0 0 22px #5ba8ff18,inset 0 1px #ffffff18}}
+.stat span{{display:block;color:#8696ad;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}}.stat strong{{font-size:20px;font-variant-numeric:tabular-nums;text-shadow:0 2px 14px #000}}
+
+.positive{{color:var(--green)!important;text-shadow:0 0 18px #14e6a033!important}}.negative{{color:var(--red)!important;text-shadow:0 0 18px #ff4d6d33!important}}.section-head{{display:flex;align-items:end;justify-content:space-between;margin:24px 2px 13px}}.section-head h2{{font-size:16px;margin:0;letter-spacing:.2px}}.section-head h2:after{{content:"";display:block;width:42px;height:3px;margin-top:8px;border-radius:3px;background:linear-gradient(90deg,var(--gold),transparent);box-shadow:0 0 12px #f8c24655}}.section-head span{{font-size:11px;color:var(--muted)}}
+.position-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:16px}}.position{{position:relative;overflow:hidden;background:linear-gradient(145deg,#182230f2,#0b111af2);border:1px solid #ffffff14;border-radius:18px;padding:19px;box-shadow:0 20px 38px #0009,inset 0 1px #ffffff12;transform-style:preserve-3d;transition:.25s ease}}
+.position:before{{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 90% 0%,var(--glow),transparent 40%),linear-gradient(115deg,#ffffff0c,transparent 35%)}}.position:after{{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;background:linear-gradient(90deg,transparent,var(--accent),transparent);box-shadow:0 0 18px var(--accent)}}.position:hover{{transform:translateY(-6px) rotateX(2deg) rotateY(-1deg);box-shadow:0 30px 50px #000b,0 0 28px var(--glow),inset 0 1px #ffffff18}}.position.long{{--accent:var(--green);--glow:#14e6a018;border-color:#14e6a044}}.position.short{{--accent:var(--red);--glow:#ff4d6d18;border-color:#ff4d6d44}}
+.position-top{{position:relative;display:flex;justify-content:space-between;align-items:start;margin-bottom:19px}}.symbol{{font-size:20px;font-weight:900;letter-spacing:.3px}}.side{{font-size:10px;font-weight:950;padding:6px 10px;border:1px solid currentColor;border-radius:7px;box-shadow:0 6px 16px #0007}}
+.long .side{{color:var(--green);background:#14e6a012}}.short .side{{color:var(--red);background:#ff4d6d12}}.position-meta{{color:var(--muted);font-size:11px;margin-top:5px}}.pnl{{text-align:right}}.pnl strong{{display:block;font-size:23px;font-variant-numeric:tabular-nums}}.pnl small{{color:var(--muted)}}.long .pnl strong{{color:var(--green);text-shadow:0 0 18px #14e6a040}}.short .pnl strong{{color:var(--red);text-shadow:0 0 18px #ff4d6d40}}
+.price-grid{{position:relative;display:grid;grid-template-columns:repeat(3,1fr);gap:9px;padding-top:14px;border-top:1px solid #ffffff10}}.price-grid div{{padding:9px 10px;border-radius:10px;background:#05091070;box-shadow:inset 0 1px 5px #0008,inset 0 1px #ffffff08}}.price-grid span{{color:var(--muted);font-size:9px;display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.65px}}.price-grid b{{font-size:13px;font-variant-numeric:tabular-nums}}
+.risk-row{{position:relative;display:flex;justify-content:space-between;gap:8px;margin-top:13px;padding-top:12px;border-top:1px solid #ffffff10;font-size:11px;color:var(--muted)}}.risk-row b{{color:var(--text)}}.empty{{grid-column:1/-1;position:relative;overflow:hidden;background:linear-gradient(145deg,#111925cc,#090e16cc);border:1px solid #ffffff12;border-radius:18px;padding:48px;text-align:center;color:var(--muted);box-shadow:0 20px 42px #0008,inset 0 1px #ffffff0c}}.empty:before{{content:"◈";display:block;color:var(--gold);font-size:28px;margin-bottom:10px;text-shadow:0 0 22px #f8c24688}}
+.table-wrap{{overflow:auto;border:1px solid #ffffff12;border-radius:18px;background:linear-gradient(145deg,#131b27e8,#090e16e8);box-shadow:0 20px 42px #0008,inset 0 1px #ffffff0d}}table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:9px;text-transform:uppercase;letter-spacing:.9px;color:var(--muted);text-align:left;background:#ffffff05}}th,td{{padding:13px 15px;border-bottom:1px solid #ffffff0b}}td{{font-size:12px;font-variant-numeric:tabular-nums}}tbody tr{{transition:.18s}}tbody tr:hover{{background:#ffffff05}}tr:last-child td{{border-bottom:0}}.side-text.long{{color:var(--green);font-weight:850}}.side-text.short{{color:var(--red);font-weight:850}}footer{{color:#647087;font-size:9px;text-align:center;margin-top:25px}}
+@media(max-width:1050px){{.stats{{grid-template-columns:repeat(3,1fr)}}}}@media(max-width:700px){{.shell{{padding:14px}}.topbar{{align-items:flex-start;flex-direction:column}}.top-actions{{width:100%;flex-wrap:wrap}}.status{{flex:1}}.stats{{grid-template-columns:repeat(2,1fr);gap:10px}}.stat{{padding:14px}}.position-grid{{grid-template-columns:1fr}}.risk-row{{flex-wrap:wrap}}}}
 </style></head><body><main class="shell">
 <header class="topbar"><div class="brand"><div class="logo">Q</div><div><h1>Quant Futures</h1><p>Risk kontrollü piyasa simülasyonu</p></div></div>
-<div style="display:flex;gap:8px;align-items:center"><div class="mode">SIMULATION</div><div class="{status_class}">{status}</div></div></header>
+<div class="top-actions"><div class="mode">SIMÜLASYON</div><div class="{status_class}">{status}</div></div></header>
 <section class="stats">
-<div class="stat"><span>Toplam Bakiye</span><strong>&#36;{balance:.2}</strong></div>
-<div class="stat"><span>Toplam ROI</span><strong class="{roi_class}">{roi:+.2}%</strong></div>
-<div class="stat"><span>Açık PnL</span><strong class="{open_class}">&#36;{open_pnl:+.2}</strong></div>
-<div class="stat"><span>Kullanılan Marjin</span><strong>&#36;{used_margin:.2}</strong></div>
-<div class="stat"><span>Başarı Oranı</span><strong>{win_rate:.1}%</strong></div>
-<div class="stat"><span>Profit Factor</span><strong>{pf:.2}</strong></div></section>
+<div class="stat"><span>Toplam Bakiye</span><strong>{balance} USDT</strong></div>
+<div class="stat"><span>Toplam Getiri</span><strong class="{roi_class}">{roi}</strong></div>
+<div class="stat"><span>Açık Kâr / Zarar</span><strong class="{open_class}">{open_pnl} USDT</strong></div>
+<div class="stat"><span>Kullanılan Marjin</span><strong>{used_margin} USDT</strong></div>
+<div class="stat"><span>Başarı Oranı</span><strong>{win_rate}</strong></div>
+<div class="stat"><span>Kâr Faktörü</span><strong>{pf}</strong></div></section>
 <div class="section-head"><h2>Açık Pozisyonlar</h2><span>{position_count} pozisyon</span></div><section class="position-grid">"#,
         status_class = status_class,
         status = escape_html(status_text),
-        balance = state.accounting.current_balance,
+        balance = balance_text,
         roi_class = roi_class,
-        roi = state.accounting.total_roi,
+        roi = roi_text,
         open_class = if open_pnl >= 0.0 {
             "positive"
         } else {
             "negative"
         },
-        open_pnl = open_pnl,
-        used_margin = used_margin,
-        win_rate = win_rate,
-        pf = state.stats.profit_factor,
+        open_pnl = open_pnl_text,
+        used_margin = used_margin_text,
+        win_rate = win_rate_text,
+        pf = profit_factor_text,
         position_count = state.positions.len()
     );
 
@@ -1084,24 +1127,29 @@ table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:10px;t
                 "short"
             };
             let notional = position.margin_usdt * position.leverage;
+            let leverage_text = format_tr_number(position.leverage, 0, false);
+            let notional_text = format_money(notional, false);
+            let pnl_usd_text = format_money(position.pnl_usd, true);
+            let pnl_percent_text = format_percent(position.pnl_percent, 2, true);
+            let margin_text = format_money(position.margin_usdt, false);
             html.push_str(&format!(
                 r#"<article class="position {side_class}"><div class="position-top">
-<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage:.0}x kaldıraç · &#36;{notional:.2} işlem</div></div>
-<div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong>&#36;{pnl_usd:+.2}</strong><small>{pnl_percent:+.2}%</small></div></div></div>
+<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage}x kaldıraç · {notional} USDT pozisyon</div></div>
+<div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong>{pnl_usd} USDT</strong><small>{pnl_percent}</small></div></div></div>
 <div class="price-grid"><div><span>Giriş</span><b>{entry}</b></div><div><span>Anlık</span><b>{current}</b></div><div><span>Miktar</span><b>{quantity}</b></div></div>
-<div class="risk-row"><span>Marjin <b>&#36;{margin:.2}</b></span><span>Stop <b>{stop}</b></span><span>Hedef <b>{take_profit}</b></span></div></article>"#,
-                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=position.leverage,notional=notional,
-                side=escape_html(&position.side),pnl_usd=position.pnl_usd,pnl_percent=position.pnl_percent,entry=format_price(position.entry_price),
-                current=format_price(position.current_price),quantity=format_quantity(&position.quantity),margin=position.margin_usdt,
+<div class="risk-row"><span>Marjin <b>{margin} USDT</b></span><span>Stop <b>{stop}</b></span><span>Hedef <b>{take_profit}</b></span></div></article>"#,
+                side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=leverage_text,notional=notional_text,
+                side=escape_html(&position.side),pnl_usd=pnl_usd_text,pnl_percent=pnl_percent_text,entry=format_price(position.entry_price),
+                current=format_price(position.current_price),quantity=format_quantity(&position.quantity),margin=margin_text,
                 stop=format_price(position.stop_loss),take_profit=format_price(position.take_profit)
             ));
         }
     }
 
     html.push_str(&format!(
-        r#"</section><div class="section-head"><h2>İşlem Geçmişi</h2><span>{closed} kapanan · İşlem başı &#36;{expectancy:+.2}</span></div>
+        r#"</section><div class="section-head"><h2>İşlem Geçmişi</h2><span>{closed} kapanan · İşlem başı {expectancy} USDT</span></div>
 <div class="table-wrap"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Sonuç</th><th>PnL</th><th>PnL &#36;</th></tr></thead><tbody>"#,
-        closed=state.accounting.closed_trades_count,expectancy=state.stats.expectancy
+        closed=state.accounting.closed_trades_count,expectancy=format_money(state.stats.expectancy, true)
     ));
     if state.history.is_empty() {
         html.push_str(r#"<tr><td colspan="8" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
@@ -1118,10 +1166,10 @@ table{{width:100%;border-collapse:collapse;min-width:800px}}th{{font-size:10px;t
                 "negative"
             };
             html.push_str(&format!(
-                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{status}</td><td class="{pnl_class}">{pnl_percent:+.2}%</td><td class="{pnl_class}">&#36;{pnl_usd:+.2}</td></tr>"#,
+                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{status}</td><td class="{pnl_class}">{pnl_percent}</td><td class="{pnl_class}">{pnl_usd} USDT</td></tr>"#,
                 id=trade.id,symbol=escape_html(&trade.symbol),side_class=side_class,side=escape_html(&trade.side),
                 entry=format_price(trade.entry_price),exit=format_price(trade.exit_price),status=escape_html(&trade.status),
-                pnl_class=pnl_class,pnl_percent=trade.pnl_percent,pnl_usd=trade.pnl_usd
+                pnl_class=pnl_class,pnl_percent=format_percent(trade.pnl_percent, 2, true),pnl_usd=format_money(trade.pnl_usd, true)
             ));
         }
     }
@@ -1272,6 +1320,7 @@ mod tests {
     fn quantity_respects_exchange_filters() {
         let filters = SymbolFilters {
             min_qty: 0.001,
+
             max_qty: 100.0,
             step_size: 0.001,
         };
@@ -1311,10 +1360,13 @@ mod tests {
 
     #[test]
     fn display_numbers_use_bounded_precision() {
-        assert_eq!(format_price(12_345.678_9), "12345.68");
-        assert_eq!(format_price(12.345678), "12.3457");
-        assert_eq!(format_price(0.123456789), "0.123457");
-        assert_eq!(format_price(0.00123456789), "0.00123457");
-        assert_eq!(format_quantity("199468.08500000"), "199468.09");
+        assert_eq!(format_price(12_345.678_9), "12.345,68");
+        assert_eq!(format_price(12.345678), "12,3457");
+        assert_eq!(format_price(0.123456789), "0,123457");
+        assert_eq!(format_price(0.00123456789), "0,00123457");
+        assert_eq!(format_quantity("199468.08500000"), "199.468,09");
+        assert_eq!(format_money(10_000.0, false), "10.000,00");
+        assert_eq!(format_money(-1_234.5, true), "-1.234,50");
+        assert_eq!(format_percent(12.5, 2, true), "+12,50%");
     }
 }
