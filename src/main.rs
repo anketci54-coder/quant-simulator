@@ -195,7 +195,11 @@ fn format_quantity(value: &str) -> String {
                     .trim_end_matches('0')
                     .trim_end_matches('.')
                     .to_string();
-                if trimmed.is_empty() { "0".to_string() } else { trimmed }
+                if trimmed.is_empty() {
+                    "0".to_string()
+                } else {
+                    trimmed
+                }
             }
         })
         .unwrap_or_else(|_| value.to_string())
@@ -1230,5 +1234,4 @@ mod tests {
         assert_eq!(format_price(0.00123456789), "0.00123457");
         assert_eq!(format_quantity("199468.08500000"), "199468.09");
     }
-
 }
