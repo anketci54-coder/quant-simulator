@@ -199,7 +199,6 @@ impl Config {
 struct Ticker {
     symbol: String,
     #[serde(rename = "priceChangePercent")]
-
     price_change_percent: String,
     #[serde(rename = "quoteVolume")]
     quote_volume: String,
@@ -300,7 +299,6 @@ fn spread_percent(book: &BookTicker) -> Option<f64> {
     let mid = (bid + ask) / 2.0;
     if bid <= 0.0 || ask < bid || mid <= 0.0 {
         None
-
     } else {
         Some(((ask - bid) / mid) * 100.0)
     }
@@ -401,7 +399,6 @@ fn init_db() -> Result<Connection, String> {
         "ALTER TABLE active_positions ADD COLUMN tp2_price REAL NOT NULL DEFAULT 0",
         "ALTER TABLE active_positions ADD COLUMN tp_stage INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE active_positions ADD COLUMN realized_pnl_usd REAL NOT NULL DEFAULT 0",
-
         "ALTER TABLE active_positions ADD COLUMN atr REAL NOT NULL DEFAULT 0",
     ] {
         let _ = conn.execute(migration, []);
@@ -461,10 +458,7 @@ fn load_consecutive_losses(conn: &Mutex<Connection>) -> usize {
         .count()
 }
 
-fn load_or_create_daily_starting_balance(
-    conn: &Mutex<Connection>,
-    current_balance: f64,
-) -> f64 {
+fn load_or_create_daily_starting_balance(conn: &Mutex<Connection>, current_balance: f64) -> f64 {
     let Ok(c) = conn.lock() else {
         return current_balance;
     };
@@ -502,7 +496,6 @@ fn load_or_create_daily_starting_balance(
         eprintln!("Günlük başlangıç bakiyesi kaydedilemedi: {error}");
     }
     current_balance
-
 }
 
 fn atomic_batch_save(
@@ -602,7 +595,6 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
     }
     Ok(positions)
 }
-
 
 fn load_history_from_db(
     conn: &Mutex<Connection>,
@@ -704,7 +696,6 @@ fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> D
         if let Err(e) = c.execute(
             "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('current_balance', ?1)",
             params![current.to_string()],
-
         ) {
             eprintln!("Ledger bakiye uzlaştırması kaydedilemedi: {e}");
         }
@@ -806,16 +797,12 @@ fn calculate_obi(
     }
 }
 
-
 fn ema(values: &[f64], period: usize) -> Option<f64> {
     let first = *values.first()?;
     let multiplier = 2.0 / (period as f64 + 1.0);
-    Some(
-        values
-            .iter()
-            .skip(1)
-            .fold(first, |current, value| (value - current) * multiplier + current),
-    )
+    Some(values.iter().skip(1).fold(first, |current, value| {
+        (value - current) * multiplier + current
+    }))
 }
 
 fn calculate_fast_indicators(
@@ -829,7 +816,10 @@ fn calculate_fast_indicators(
     let ema_fast = ema(closes, 8)?;
     let ema_slow = ema(closes, 21)?;
 
-    let changes: Vec<f64> = closes.windows(2).map(|window| window[1] - window[0]).collect();
+    let changes: Vec<f64> = closes
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect();
     let rsi_period = changes.len().min(7);
     let recent_changes = &changes[changes.len() - rsi_period..];
     let gains: f64 = recent_changes.iter().map(|change| change.max(0.0)).sum();
@@ -906,7 +896,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
         .timeout(Duration::from_secs(10))
         .build()
     {
-
         Ok(client) => client,
         Err(e) => {
             if let Ok(mut state) = shared_state.lock() {
@@ -923,8 +912,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
         .lock()
         .map(|state| state.accounting.current_balance)
         .unwrap_or(0.0);
-    let session_starting_balance =
-        load_or_create_daily_starting_balance(&db_conn, current_balance);
+    let session_starting_balance = load_or_create_daily_starting_balance(&db_conn, current_balance);
     loop {
         if symbol_filters.is_empty() {
             match fetch_symbol_filters(&client, &config) {
@@ -1007,7 +995,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             let mut remaining_quantity =
                                 pos.quantity.parse::<f64>().unwrap_or_default();
                             let initial_quantity = pos
-
                                 .initial_quantity
                                 .parse::<f64>()
                                 .unwrap_or(remaining_quantity);
@@ -1026,8 +1013,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             }
 
                             if let Some(filters) = symbol_filters.get(&pos.symbol) {
-                                let tp1_hit = (pos.side == "LONG"
-                                    && curr_price >= pos.tp1_price)
+                                let tp1_hit = (pos.side == "LONG" && curr_price >= pos.tp1_price)
                                     || (pos.side == "SHORT" && curr_price <= pos.tp1_price);
                                 if pos.tp_stage == 0 && tp1_hit {
                                     if let Some(close_quantity) = partial_quantity(
@@ -1059,8 +1045,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                     }
                                 }
 
-                                let tp2_hit = (pos.side == "LONG"
-                                    && curr_price >= pos.tp2_price)
+                                let tp2_hit = (pos.side == "LONG" && curr_price >= pos.tp2_price)
                                     || (pos.side == "SHORT" && curr_price <= pos.tp2_price);
                                 if pos.tp_stage == 1 && tp2_hit {
                                     if let Some(close_quantity) = partial_quantity(
@@ -1108,14 +1093,12 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             remaining_quantity = pos.quantity.parse::<f64>().unwrap_or_default();
                             let remaining_pnl = calculate_trade_pnl(
                                 &pos.side,
-
                                 pos.entry_price,
                                 curr_price,
                                 remaining_quantity,
                             )
                             .unwrap_or_default();
-                            pos.margin_usdt =
-                                remaining_quantity * pos.entry_price / pos.leverage;
+                            pos.margin_usdt = remaining_quantity * pos.entry_price / pos.leverage;
                             pos.pnl_usd = pos.realized_pnl_usd + remaining_pnl;
                             let mut close_reason = None;
                             if pos.side == "LONG" {
@@ -1209,7 +1192,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                     let mut candidates: Vec<&Ticker> = tickers
                         .iter()
                         .filter(|ticker| is_tradeable_usdt_symbol(&ticker.symbol))
-
                         .filter(|ticker| {
                             ticker
                                 .quote_volume
@@ -1411,7 +1393,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 for closed in &newly_closed {
-
                     symbol_cooldowns.insert(closed.symbol.clone(), Instant::now());
                     if closed.pnl_usd < 0.0 {
                         consecutive_losses += 1;
@@ -1613,7 +1594,6 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
                 exit_stage=escape_html(&trade.exit_stage),max_pnl=format_percent(trade.max_pnl_percent, 2, true),
                 pnl_class=pnl_class,pnl_percent=format_percent(trade.pnl_percent, 2, true),pnl_usd=format_money(trade.pnl_usd, true)
             ));
-
         }
     }
     html.push_str("</tbody></table></div><footer>Veriler 3 saniyede bir yenilenir · Simülasyon sonuçları gerçek piyasa performansı garantisi değildir.</footer></main></body></html>");
