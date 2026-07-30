@@ -624,7 +624,1145 @@ fn atomic_batch_save(
             PositionLifecycle::PendingOpen => "PendingOpen",
             PositionLifecycle::Open => "Open",
             PositionLifecycle::Closed => "Closed",
-   …14063 tokens truncated…teY(-1deg);box-shadow:0 30px 50px #000b,0 0 28px var(--glow),inset 0 1px #ffffff18}}.position.long{{--accent:var(--green);--glow:#14e6a018;border-color:#14e6a044}}.position.short{{--accent:var(--red);--glow:#ff4d6d18;border-color:#ff4d6d44}}
+        };
+        tx.execute(
+            "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr, opened_at, strategy_version, entry_ema_fast, entry_ema_slow, entry_rsi, entry_adx, entry_obi, entry_spread, market_regime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone(), p.initial_quantity.clone(), p.tp1_price, p.tp2_price, p.tp_stage as i64, p.realized_pnl_usd, p.atr, p.opened_at, p.strategy_version.clone(), p.entry_ema_fast, p.entry_ema_slow, p.entry_rsi, p.entry_adx, p.entry_obi, p.entry_spread, p.market_regime.clone()],
+        ).map_err(|e| e.to_string())?;
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('current_balance', ?1)",
+        params![acc.current_balance.to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('starting_balance', ?1)",
+        params![acc.starting_balance.to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActivePosition>, String> {
+    let mut positions = Vec::new();
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr, opened_at, strategy_version, entry_ema_fast, entry_ema_slow, entry_rsi, entry_adx, entry_obi, entry_spread, market_regime FROM active_positions").map_err(|e| e.to_string())?;
+    let iter = stmt
+        .query_map([], |row| {
+            let lc_str: String = row.get(11)?;
+            let lifecycle = match lc_str.as_str() {
+                "PendingOpen" => PositionLifecycle::PendingOpen,
+                "Open" => PositionLifecycle::Open,
+                "Closed" => PositionLifecycle::Closed,
+                _ => PositionLifecycle::Closed,
+            };
+            Ok(ActivePosition {
+                id: row.get::<_, i64>(0)? as usize,
+                symbol: row.get(1)?,
+                side: row.get(2)?,
+                entry_price: row.get(3)?,
+                current_price: row.get(4)?,
+                stop_loss: row.get(5)?,
+                take_profit: row.get(6)?,
+                best_price: row.get(7)?,
+                peak_pnl_percent: row.get(8)?,
+                leverage: row.get(9)?,
+                margin_usdt: row.get(10)?,
+                lifecycle,
+                status: row.get(12)?,
+                pnl_percent: row.get(13)?,
+                pnl_usd: row.get(14)?,
+                quantity: row.get(15)?,
+                initial_quantity: {
+                    let value: String = row.get(16)?;
+                    if value == "0" {
+                        row.get(15)?
+                    } else {
+                        value
+                    }
+                },
+                tp1_price: row.get(17)?,
+                tp2_price: row.get(18)?,
+                tp_stage: row.get::<_, i64>(19)? as u8,
+                realized_pnl_usd: row.get(20)?,
+                atr: row.get(21)?,
+                opened_at: row.get(22)?,
+                strategy_version: row.get(23)?,
+                entry_ema_fast: row.get(24)?,
+                entry_ema_slow: row.get(25)?,
+                entry_rsi: row.get(26)?,
+                entry_adx: row.get(27)?,
+                entry_obi: row.get(28)?,
+                entry_spread: row.get(29)?,
+                market_regime: row.get(30)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in iter {
+        positions.push(row.map_err(|e| format!("Aktif pozisyon satırı okunamadı: {e}"))?);
+    }
+    Ok(positions)
+}
+
+fn load_history_from_db(
+    conn: &Mutex<Connection>,
+) -> Result<(Vec<ClosedPosition>, usize, usize), String> {
+    let mut history = Vec::new();
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let total_count: usize = c
+        .query_row("SELECT COUNT(*) FROM closed_trades", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
+    let successful_count: usize = c
+        .query_row(
+            "SELECT COUNT(*) FROM closed_trades WHERE pnl_percent > 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+
+    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage, opened_at, closed_at, strategy_version, entry_rsi, entry_adx, entry_obi, market_regime FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
+    let iter = stmt
+        .query_map([], |row| {
+            Ok(ClosedPosition {
+                id: row.get::<_, i64>(0)? as usize,
+                symbol: row.get(1)?,
+                side: row.get(2)?,
+                entry_price: row.get(3)?,
+                exit_price: row.get(4)?,
+                status: row.get(5)?,
+                pnl_percent: row.get(6)?,
+                pnl_usd: row.get(7)?,
+                max_pnl_percent: row.get(8)?,
+                exit_stage: row.get(9)?,
+                opened_at: row.get(10)?,
+                closed_at: row.get(11)?,
+                strategy_version: row.get(12)?,
+                entry_rsi: row.get(13)?,
+                entry_adx: row.get(14)?,
+                entry_obi: row.get(15)?,
+                market_regime: row.get(16)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in iter {
+        history.push(row.map_err(|e| format!("Geçmiş işlem satırı okunamadı: {e}"))?);
+    }
+    history.reverse();
+    Ok((history, total_count, successful_count))
+}
+
+fn load_performance_stats(conn: &Mutex<Connection>) -> Result<PerformanceStats, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let (gross_profit, gross_loss, trade_count): (f64, f64, i64) = c
+        .query_row(
+            "SELECT COALESCE(SUM(CASE WHEN pnl_usd > 0 THEN pnl_usd ELSE 0 END), 0.0), COALESCE(SUM(CASE WHEN pnl_usd < 0 THEN -pnl_usd ELSE 0 END), 0.0), COUNT(*) FROM closed_trades",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let profit_factor = if gross_loss > 0.0 {
+        gross_profit / gross_loss
+    } else if gross_profit > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+    let expectancy = if trade_count > 0 {
+        (gross_profit - gross_loss) / trade_count as f64
+    } else {
+        0.0
+    };
+    let (strategy_trade_count, strategy_pnl): (i64, f64) = c
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0.0) FROM closed_trades WHERE strategy_version = ?1",
+            params![STRATEGY_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0.0));
+    Ok(PerformanceStats {
+        profit_factor,
+        expectancy,
+        strategy_trade_count: strategy_trade_count as usize,
+        strategy_pnl,
+    })
+}
+
+fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> DailyAccounting {
+    let mut starting = default_starting;
+    let mut ledger_pnl = 0.0;
+    let mut date = "unknown".to_string();
+    if let Ok(c) = conn.lock() {
+        if let Ok(val) = c.query_row(
+            "SELECT value FROM kv_store WHERE key='starting_balance'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            if let Ok(parsed) = val.parse::<f64>() {
+                starting = parsed;
+            }
+        }
+        ledger_pnl = c
+            .query_row(
+                "SELECT COALESCE(SUM(pnl_usd), 0.0) FROM closed_trades",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(0.0);
+        date = c
+            .query_row("SELECT date('now')", [], |row| row.get::<_, String>(0))
+            .unwrap_or_else(|_| "unknown".to_string());
+    }
+    let current = starting + ledger_pnl;
+    if let Ok(c) = conn.lock() {
+        if let Err(e) = c.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('current_balance', ?1)",
+            params![current.to_string()],
+        ) {
+            eprintln!("Ledger bakiye uzlaştırması kaydedilemedi: {e}");
+        }
+    }
+    let total_roi = if starting > 0.0 {
+        ((current - starting) / starting) * 100.0
+    } else {
+        0.0
+    };
+    DailyAccounting {
+        date,
+        starting_balance: starting,
+        current_balance: current,
+        total_roi,
+        closed_trades_count: 0,
+        successful_trades: 0,
+    }
+}
+
+fn fetch_symbol_filters(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+) -> Result<HashMap<String, SymbolFilters>, String> {
+    let url = config.futures_url("fapi/v1/exchangeInfo");
+    let info = client
+        .get(&url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("exchangeInfo request failed: {e}"))?
+        .json::<ExchangeInfo>()
+        .map_err(|e| format!("exchangeInfo parse failed: {e}"))?;
+
+    let mut result = HashMap::new();
+    for symbol in info.symbols {
+        for filter in symbol.filters {
+            if let ExchangeFilter::LotSize {
+                min_qty,
+                max_qty,
+                step_size,
+            } = filter
+            {
+                if let (Ok(min_qty), Ok(max_qty), Ok(step_size)) = (
+                    min_qty.parse::<f64>(),
+                    max_qty.parse::<f64>(),
+                    step_size.parse::<f64>(),
+                ) {
+                    result.insert(
+                        symbol.symbol.clone(),
+                        SymbolFilters {
+                            min_qty,
+                            max_qty,
+                            step_size,
+                        },
+                    );
+                }
+                break;
+            }
+        }
+    }
+    if result.is_empty() {
+        Err("exchangeInfo returned no usable LOT_SIZE filters".to_string())
+    } else {
+        Ok(result)
+    }
+}
+
+fn calculate_obi(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    symbol: &str,
+) -> Result<f64, String> {
+    let url = format!(
+        "{}?symbol={}&limit=5",
+        config.futures_url("fapi/v1/depth"),
+        symbol
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| format!("depth request failed for {symbol}: {e}"))?;
+    let depth = resp
+        .json::<Depth>()
+        .map_err(|e| format!("depth parse failed for {symbol}: {e}"))?;
+    let bid_vol: f64 = depth
+        .bids
+        .iter()
+        .filter_map(|b| b.get(1).and_then(|v| v.parse::<f64>().ok()))
+        .sum();
+    let ask_vol: f64 = depth
+        .asks
+        .iter()
+        .filter_map(|a| a.get(1).and_then(|v| v.parse::<f64>().ok()))
+        .sum();
+    if bid_vol + ask_vol > 0.0 {
+        Ok((bid_vol - ask_vol) / (bid_vol + ask_vol))
+    } else {
+        Ok(0.0)
+    }
+}
+
+fn ema(values: &[f64], period: usize) -> Option<f64> {
+    let first = *values.first()?;
+    let multiplier = 2.0 / (period as f64 + 1.0);
+    Some(values.iter().skip(1).fold(first, |current, value| {
+        (value - current) * multiplier + current
+    }))
+}
+
+fn calculate_fast_indicators(
+    highs: &[f64],
+    lows: &[f64],
+    closes: &[f64],
+) -> Option<FastIndicators> {
+    if closes.len() < 22 || highs.len() != closes.len() || lows.len() != closes.len() {
+        return None;
+    }
+    let ema_fast = ema(closes, 8)?;
+    let ema_slow = ema(closes, 21)?;
+
+    let changes: Vec<f64> = closes
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect();
+    let rsi_period = changes.len().min(7);
+    let recent_changes = &changes[changes.len() - rsi_period..];
+    let gains: f64 = recent_changes.iter().map(|change| change.max(0.0)).sum();
+    let losses: f64 = recent_changes.iter().map(|change| (-change).max(0.0)).sum();
+    let rsi = if losses <= f64::EPSILON {
+        100.0
+    } else {
+        100.0 - (100.0 / (1.0 + gains / losses))
+    };
+
+    let true_ranges: Vec<f64> = (1..closes.len())
+        .map(|index| {
+            let high_low = highs[index] - lows[index];
+            let high_close = (highs[index] - closes[index - 1]).abs();
+            let low_close = (lows[index] - closes[index - 1]).abs();
+            high_low.max(high_close).max(low_close)
+        })
+        .collect();
+    let atr_period = true_ranges.len().min(14);
+    let atr = true_ranges[true_ranges.len() - atr_period..]
+        .iter()
+        .sum::<f64>()
+        / atr_period as f64;
+    if atr <= 0.0 || !atr.is_finite() {
+        return None;
+    }
+    let directional_period = (closes.len() - 1).min(14);
+    let start = closes.len() - directional_period;
+    let mut positive_dm = 0.0;
+    let mut negative_dm = 0.0;
+    for index in start..closes.len() {
+        let upward = highs[index] - highs[index - 1];
+        let downward = lows[index - 1] - lows[index];
+        if upward > downward && upward > 0.0 {
+            positive_dm += upward;
+        }
+        if downward > upward && downward > 0.0 {
+            negative_dm += downward;
+        }
+    }
+    let positive_di = 100.0 * (positive_dm / directional_period as f64) / atr;
+    let negative_di = 100.0 * (negative_dm / directional_period as f64) / atr;
+    let adx = if positive_di + negative_di > f64::EPSILON {
+        100.0 * (positive_di - negative_di).abs() / (positive_di + negative_di)
+    } else {
+        0.0
+    };
+    Some(FastIndicators {
+        ema_fast,
+        ema_slow,
+        rsi,
+        atr,
+        adx,
+    })
+}
+
+fn fetch_fast_indicators(
+    client: &reqwest::blocking::Client,
+    config: &Config,
+    symbol: &str,
+    interval: &str,
+) -> Result<FastIndicators, String> {
+    let url = format!(
+        "{}?symbol={symbol}&interval={interval}&limit=60",
+        config.futures_url("fapi/v1/klines")
+    );
+    let rows = client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| format!("kline request failed for {symbol}: {error}"))?
+        .json::<Vec<Vec<serde_json::Value>>>()
+        .map_err(|error| format!("kline parse failed for {symbol}: {error}"))?;
+    let mut highs = Vec::with_capacity(rows.len());
+    let mut lows = Vec::with_capacity(rows.len());
+    let mut closes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let parse = |index: usize| {
+            row.get(index)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<f64>().ok())
+        };
+        let (Some(high), Some(low), Some(close)) = (parse(2), parse(3), parse(4)) else {
+            continue;
+        };
+        highs.push(high);
+        lows.push(low);
+        closes.push(close);
+    }
+    calculate_fast_indicators(&highs, &lows, &closes)
+        .ok_or_else(|| format!("insufficient indicator data for {symbol}"))
+}
+
+fn classify_market_regime(indicators: &FastIndicators) -> MarketRegime {
+    if indicators.adx < 18.0 {
+        MarketRegime::Sideways
+    } else if indicators.ema_fast > indicators.ema_slow && indicators.rsi >= 52.0 {
+        MarketRegime::Bull
+    } else if indicators.ema_fast < indicators.ema_slow && indicators.rsi <= 48.0 {
+        MarketRegime::Bear
+    } else {
+        MarketRegime::Sideways
+    }
+}
+
+fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Connection>>) {
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            if let Ok(mut state) = shared_state.lock() {
+                state.last_error = format!("HTTP istemcisi oluşturulamadı: {e}");
+            }
+            return;
+        }
+    };
+    let mut symbol_filters: HashMap<String, SymbolFilters> = HashMap::new();
+    let mut obi_samples: HashMap<String, VecDeque<f64>> = HashMap::new();
+    let mut symbol_cooldowns = load_symbol_cooldowns(&db_conn);
+    let mut consecutive_losses = load_consecutive_losses(&db_conn);
+    let current_balance = shared_state
+        .lock()
+        .map(|state| state.accounting.current_balance)
+        .unwrap_or(0.0);
+    let session_starting_balance = load_or_create_daily_starting_balance(&db_conn, current_balance);
+    loop {
+        if symbol_filters.is_empty() {
+            match fetch_symbol_filters(&client, &config) {
+                Ok(filters) => symbol_filters = filters,
+                Err(e) => {
+                    if let Ok(mut state) = shared_state.lock() {
+                        state.last_error = e;
+                    }
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            }
+        }
+        let url = config.futures_url("fapi/v1/ticker/24hr");
+        let tickers_result = client
+            .get(&url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.json::<Vec<Ticker>>());
+        match tickers_result {
+            Ok(tickers) => {
+                let book_map: HashMap<String, BookTicker> = client
+                    .get(config.futures_url("fapi/v1/ticker/bookTicker"))
+                    .send()
+                    .and_then(|r| r.error_for_status())
+                    .and_then(|r| r.json::<Vec<BookTicker>>())
+                    .map(|books| {
+                        books
+                            .into_iter()
+                            .map(|book| (book.symbol.clone(), book))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut state = match shared_state.lock() {
+                    Ok(s) => s.clone(),
+                    Err(_) => {
+                        thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                let mut newly_closed = Vec::new();
+                let mut still_active = Vec::new();
+                let mut current_err =
+                    String::from("Sistem Kararlı Çalışıyor (Risk Kontrollü Simülasyon Modu)");
+                let mut batch_realized_pnl = 0.0;
+
+                for mut pos in state.positions {
+                    if pos.lifecycle == PositionLifecycle::PendingOpen {
+                        pos.lifecycle = PositionLifecycle::Open;
+
+                        pos.status = format!(
+                            "Simüle Edilmiş Emir Gerçekleşti ({}x / ${:.0}) [Gelişmiş Koruma]",
+                            pos.side, pos.margin_usdt
+                        );
+                    }
+                    if let Some(t) = tickers.iter().find(|x| x.symbol == pos.symbol) {
+                        if let Ok(curr_price) = t.last_price.parse::<f64>() {
+                            pos.current_price = curr_price;
+                            if pos.side == "LONG" {
+                                if curr_price > pos.best_price {
+                                    pos.best_price = curr_price;
+                                }
+                            } else {
+                                if curr_price < pos.best_price {
+                                    pos.best_price = curr_price;
+                                }
+                            }
+                            let Some(pnl_percent) = calculate_pnl_percent(
+                                &pos.side,
+                                pos.entry_price,
+                                curr_price,
+                                pos.leverage,
+                            ) else {
+                                still_active.push(pos);
+                                continue;
+                            };
+                            pos.pnl_percent = pnl_percent;
+                            pos.peak_pnl_percent = pos.peak_pnl_percent.max(pos.pnl_percent);
+
+                            if pos.tp_stage == 0 && pos.peak_pnl_percent >= 0.80 {
+                                if let Some(stop) = break_even_stop(&pos.side, pos.entry_price) {
+                                    if (pos.side == "LONG" && stop > pos.stop_loss)
+                                        || (pos.side == "SHORT" && stop < pos.stop_loss)
+                                    {
+                                        pos.stop_loss = stop;
+                                        pos.status =
+                                            "Erken koruma: ücret üstü break-even".to_string();
+                                    }
+                                }
+                            }
+                            if pos.tp_stage == 0 && pos.peak_pnl_percent >= 1.50 {
+                                if let Some(stop) = protected_profit_stop(
+                                    &pos.side,
+                                    pos.entry_price,
+                                    pos.leverage,
+                                    0.40,
+                                ) {
+                                    if (pos.side == "LONG" && stop > pos.stop_loss)
+                                        || (pos.side == "SHORT" && stop < pos.stop_loss)
+                                    {
+                                        pos.stop_loss = stop;
+                                        pos.status = "Erken koruma: +%0,40 kilitlendi".to_string();
+                                    }
+                                }
+                            }
+
+                            let mut remaining_quantity =
+                                pos.quantity.parse::<f64>().unwrap_or_default();
+                            let initial_quantity = pos
+                                .initial_quantity
+                                .parse::<f64>()
+                                .unwrap_or(remaining_quantity);
+                            if pos.tp1_price <= 0.0 || pos.tp2_price <= 0.0 {
+                                let risk_distance = (pos.entry_price - pos.stop_loss).abs();
+                                pos.atr = (risk_distance / 1.8).max(pos.entry_price * 0.001);
+                                if pos.side == "LONG" {
+                                    pos.tp1_price = pos.entry_price + risk_distance;
+                                    pos.tp2_price = pos.entry_price + risk_distance * 2.0;
+                                    pos.take_profit = pos.entry_price + risk_distance * 4.0;
+                                } else {
+                                    pos.tp1_price = pos.entry_price - risk_distance;
+                                    pos.tp2_price = pos.entry_price - risk_distance * 2.0;
+                                    pos.take_profit = pos.entry_price - risk_distance * 4.0;
+                                }
+                            }
+
+                            if let Some(filters) = symbol_filters.get(&pos.symbol) {
+                                let tp1_hit = (pos.side == "LONG" && curr_price >= pos.tp1_price)
+                                    || (pos.side == "SHORT" && curr_price <= pos.tp1_price);
+                                if pos.tp_stage == 0 && tp1_hit {
+                                    if let Some(close_quantity) = partial_quantity(
+                                        initial_quantity,
+                                        remaining_quantity,
+                                        0.30,
+                                        filters,
+                                    ) {
+                                        if let Some(partial_pnl) = calculate_trade_pnl(
+                                            &pos.side,
+                                            pos.entry_price,
+                                            curr_price,
+                                            close_quantity,
+                                        ) {
+                                            pos.realized_pnl_usd += partial_pnl;
+                                            remaining_quantity -= close_quantity;
+                                            pos.quantity = exchange_quantity_text(
+                                                remaining_quantity.max(0.0),
+                                                filters,
+                                            );
+                                            pos.tp_stage = 1;
+                                            pos.status = "TP1: %30 kâr realize edildi".to_string();
+                                            if let Some(stop) =
+                                                break_even_stop(&pos.side, pos.entry_price)
+                                            {
+                                                pos.stop_loss = stop;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let tp2_hit = (pos.side == "LONG" && curr_price >= pos.tp2_price)
+                                    || (pos.side == "SHORT" && curr_price <= pos.tp2_price);
+                                if pos.tp_stage == 1 && tp2_hit {
+                                    if let Some(close_quantity) = partial_quantity(
+                                        initial_quantity,
+                                        remaining_quantity,
+                                        0.30,
+                                        filters,
+                                    ) {
+                                        if let Some(partial_pnl) = calculate_trade_pnl(
+                                            &pos.side,
+                                            pos.entry_price,
+                                            curr_price,
+                                            close_quantity,
+                                        ) {
+                                            pos.realized_pnl_usd += partial_pnl;
+                                            remaining_quantity -= close_quantity;
+                                            pos.quantity = exchange_quantity_text(
+                                                remaining_quantity.max(0.0),
+                                                filters,
+                                            );
+                                            pos.tp_stage = 2;
+                                            pos.status =
+                                                "TP2: toplam %60 kâr realize edildi".to_string();
+                                            pos.stop_loss = pos.tp1_price;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if pos.tp_stage >= 2 {
+                                let trail_distance = (pos.atr * 2.5).max(pos.entry_price * 0.004);
+                                if pos.side == "LONG" {
+                                    let trailed_stop = pos.best_price - trail_distance;
+                                    if trailed_stop > pos.stop_loss {
+                                        pos.stop_loss = trailed_stop;
+                                    }
+                                } else {
+                                    let trailed_stop = pos.best_price + trail_distance;
+                                    if trailed_stop < pos.stop_loss {
+                                        pos.stop_loss = trailed_stop;
+                                    }
+                                }
+                            }
+
+                            remaining_quantity = pos.quantity.parse::<f64>().unwrap_or_default();
+                            let remaining_pnl = calculate_trade_pnl(
+                                &pos.side,
+                                pos.entry_price,
+                                curr_price,
+                                remaining_quantity,
+                            )
+                            .unwrap_or_default();
+                            pos.margin_usdt = remaining_quantity * pos.entry_price / pos.leverage;
+                            pos.pnl_usd = pos.realized_pnl_usd + remaining_pnl;
+                            let mut close_reason = None;
+                            if pos.side == "LONG" {
+                                if curr_price <= pos.stop_loss {
+                                    close_reason = Some(if pos.tp_stage >= 2 {
+                                        "TP3 Trend Stop".to_string()
+                                    } else if pos.tp_stage == 1 {
+                                        "TP1 Sonrası Stop".to_string()
+                                    } else if pos.peak_pnl_percent >= 1.50 {
+                                        "Erken Kâr Kilidi".to_string()
+                                    } else if pos.peak_pnl_percent >= 0.80 {
+                                        "Erken Break-Even".to_string()
+                                    } else {
+                                        "Başlangıç Stop".to_string()
+                                    });
+                                }
+                            } else {
+                                if curr_price >= pos.stop_loss {
+                                    close_reason = Some(if pos.tp_stage >= 2 {
+                                        "TP3 Trend Stop".to_string()
+                                    } else if pos.tp_stage == 1 {
+                                        "TP1 Sonrası Stop".to_string()
+                                    } else if pos.peak_pnl_percent >= 1.50 {
+                                        "Erken Kâr Kilidi".to_string()
+                                    } else if pos.peak_pnl_percent >= 0.80 {
+                                        "Erken Break-Even".to_string()
+                                    } else {
+                                        "Başlangıç Stop".to_string()
+                                    });
+                                }
+                            }
+
+                            if let Some(reason) = close_reason {
+                                pos.lifecycle = PositionLifecycle::Closed;
+                                batch_realized_pnl += pos.pnl_usd;
+                                let initial_margin =
+                                    initial_quantity * pos.entry_price / pos.leverage;
+                                let total_pnl_percent = if initial_margin > 0.0 {
+                                    pos.pnl_usd / initial_margin * 100.0
+                                } else {
+                                    0.0
+                                };
+                                let exit_stage = match (pos.tp_stage, pos.peak_pnl_percent) {
+                                    (0, peak) if peak >= 1.50 => "LOCK",
+                                    (0, peak) if peak >= 0.80 => "BE",
+                                    (0, _) => "SL",
+                                    (1, _) => "TP1",
+                                    _ => "TP3",
+                                };
+                                newly_closed.push(ClosedPosition {
+                                    id: pos.id,
+                                    symbol: pos.symbol.clone(),
+                                    side: pos.side.clone(),
+                                    entry_price: pos.entry_price,
+                                    exit_price: curr_price,
+                                    status: reason,
+                                    pnl_percent: total_pnl_percent,
+                                    pnl_usd: pos.pnl_usd,
+                                    max_pnl_percent: pos.peak_pnl_percent,
+                                    exit_stage: exit_stage.to_string(),
+                                    opened_at: pos.opened_at,
+                                    closed_at: unix_timestamp(),
+                                    strategy_version: pos.strategy_version.clone(),
+                                    entry_rsi: pos.entry_rsi,
+                                    entry_adx: pos.entry_adx,
+                                    entry_obi: pos.entry_obi,
+                                    market_regime: pos.market_regime.clone(),
+                                });
+                            } else {
+                                still_active.push(pos);
+                            }
+                        } else {
+                            still_active.push(pos);
+                        }
+                    } else {
+                        still_active.push(pos);
+                    }
+                }
+
+                state.accounting.current_balance += batch_realized_pnl;
+
+                let session_drawdown = if session_starting_balance > 0.0 {
+                    ((session_starting_balance - state.accounting.current_balance)
+                        / session_starting_balance)
+                        .max(0.0)
+                } else {
+                    0.0
+                };
+                let safety_allows_entries = config.entry_enabled
+                    && session_drawdown < config.session_loss_limit
+                    && consecutive_losses < config.max_consecutive_losses;
+                if !safety_allows_entries {
+                    current_err = if !config.entry_enabled {
+                        "Yeni girişler ENTRY_ENABLED ile durduruldu".to_string()
+                    } else if consecutive_losses >= config.max_consecutive_losses {
+                        format!(
+                            "Ardışık {consecutive_losses} kayıp sonrası yeni girişler kilitlendi"
+                        )
+                    } else {
+                        format!(
+                            "Seans zarar limiti aşıldı: %{:.2}",
+                            session_drawdown * 100.0
+                        )
+                    };
+                }
+
+                if safety_allows_entries {
+                    let market_regime = fetch_fast_indicators(
+                        &client,
+                        &config,
+                        "BTCUSDT",
+                        "1h",
+                    )
+                    .map(|indicators| classify_market_regime(&indicators))
+                    .unwrap_or(MarketRegime::Sideways);
+                    if market_regime == MarketRegime::Sideways {
+                        current_err =
+                            "BTC 1s rejimi yatay: yeni girişler bekletiliyor".to_string();
+                    }
+                    let mut candidates: Vec<&Ticker> = tickers
+                        .iter()
+                        .filter(|ticker| is_tradeable_usdt_symbol(&ticker.symbol))
+                        .filter(|ticker| {
+                            ticker
+                                .quote_volume
+                                .parse::<f64>()
+                                .is_ok_and(|volume| volume >= config.min_quote_volume)
+                        })
+                        .collect();
+                    candidates.sort_by(|left, right| {
+                        let left_volume = left.quote_volume.parse::<f64>().unwrap_or(0.0);
+                        let right_volume = right.quote_volume.parse::<f64>().unwrap_or(0.0);
+                        right_volume.total_cmp(&left_volume)
+                    });
+                    candidates.truncate(config.max_signal_candidates);
+                    if market_regime == MarketRegime::Sideways {
+                        candidates.clear();
+                    }
+
+                    let market_signals = thread::scope(|scope| {
+                        let http_client = &client;
+                        let engine_config = &config;
+                        let handles: Vec<_> = candidates
+                            .into_iter()
+                            .filter_map(|ticker| {
+                                let spread =
+                                    book_map.get(&ticker.symbol).and_then(spread_percent)?;
+                                (spread <= config.max_spread_percent).then_some((ticker, spread))
+                            })
+                            .map(|(ticker, spread)| {
+                                scope.spawn(move || {
+                                    let obi =
+                                        calculate_obi(http_client, engine_config, &ticker.symbol)
+                                            .ok()?;
+                                    let one_minute = fetch_fast_indicators(
+                                        http_client,
+                                        engine_config,
+                                        &ticker.symbol,
+                                        "1m",
+                                    )
+                                    .ok()?;
+                                    let five_minute = fetch_fast_indicators(
+                                        http_client,
+                                        engine_config,
+                                        &ticker.symbol,
+                                        "5m",
+                                    )
+                                    .ok()?;
+                                    let fifteen_minute = fetch_fast_indicators(
+                                        http_client,
+                                        engine_config,
+                                        &ticker.symbol,
+                                        "15m",
+                                    )
+                                    .ok()?;
+                                    Some((
+                                        ticker.clone(),
+                                        obi,
+                                        spread,
+                                        one_minute,
+                                        five_minute,
+                                        fifteen_minute,
+                                    ))
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .filter_map(|handle| handle.join().ok().flatten())
+                            .collect::<Vec<_>>()
+                    });
+
+                    for (t, obi, spread, one_minute, five_minute, fifteen_minute) in market_signals {
+                        let (Ok(vol), Ok(price)) = (
+                            t.quote_volume.parse::<f64>(),
+                            t.last_price.parse::<f64>(),
+                        ) else {
+                            continue;
+                        };
+                        if price <= 0.0 || vol < config.min_quote_volume {
+                            continue;
+                        }
+                        let samples = obi_samples.entry(t.symbol.clone()).or_default();
+                        samples.push_back(obi);
+                        while samples.len() > config.obi_confirmation_samples {
+                            samples.pop_front();
+                        }
+                        if samples.len() < config.obi_confirmation_samples {
+                            continue;
+                        }
+                        let normalized_trend = (fifteen_minute.ema_fast
+                            - fifteen_minute.ema_slow)
+                            / fifteen_minute.atr;
+                        let long_confirmed = market_regime == MarketRegime::Bull
+                            && samples.iter().all(|value| *value >= 0.12)
+                            && normalized_trend >= 0.05
+                            && fifteen_minute.adx >= 20.0
+                            && five_minute.ema_fast > five_minute.ema_slow
+                            && five_minute.adx >= 18.0
+                            && (52.0..=72.0).contains(&five_minute.rsi)
+                            && one_minute.ema_fast >= one_minute.ema_slow
+                            && (48.0..=75.0).contains(&one_minute.rsi);
+                        let short_confirmed = market_regime == MarketRegime::Bear
+                            && samples.iter().all(|value| *value <= -0.12)
+                            && normalized_trend <= -0.05
+                            && fifteen_minute.adx >= 20.0
+                            && five_minute.ema_fast < five_minute.ema_slow
+                            && five_minute.adx >= 18.0
+                            && (28.0..=48.0).contains(&five_minute.rsi)
+                            && one_minute.ema_fast <= one_minute.ema_slow
+                            && (25.0..=52.0).contains(&one_minute.rsi);
+                        let (side, leverage) = if long_confirmed {
+                            ("LONG", 3.0)
+                        } else if short_confirmed {
+                            ("SHORT", 3.0)
+                        } else {
+                            continue;
+                        };
+                        let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
+                        let now = unix_timestamp();
+                        let cooling_down = symbol_cooldowns
+                            .get(&t.symbol)
+                            .is_some_and(|closed_at| {
+                                now.saturating_sub(*closed_at)
+                                    < config.cooldown.as_secs() as i64
+                            });
+                        if already_active
+                            || cooling_down
+                            || still_active.len() >= config.max_positions
+                        {
+                            continue;
+                        }
+                        let same_side_count = still_active
+                            .iter()
+                            .filter(|position| position.side == side)
+                            .count();
+
+                        if same_side_count >= config.max_same_side_positions {
+                            continue;
+                        }
+                        let committed_margin: f64 = still_active
+                            .iter()
+                            .map(|position| position.margin_usdt)
+                            .sum();
+                        let free_margin = state.accounting.current_balance - committed_margin;
+                        if free_margin <= 0.0 {
+                            continue;
+                        }
+                        let stop_distance =
+                            (fifteen_minute.atr * 1.8).clamp(price * 0.006, price * 0.03);
+                        let (stop_loss, tp1_price, tp2_price, take_profit) = if side == "LONG" {
+                            (
+                                price - stop_distance,
+                                price + stop_distance,
+                                price + stop_distance * 2.0,
+                                price + stop_distance * 4.0,
+                            )
+                        } else {
+                            (
+                                price + stop_distance,
+                                price - stop_distance,
+                                price - stop_distance * 2.0,
+                                price - stop_distance * 4.0,
+                            )
+                        };
+                        let Some(filters) = symbol_filters.get(&t.symbol) else {
+                            continue;
+                        };
+                        let Some((quantity, margin_usdt, new_risk)) = calculate_position_size(
+                            state.accounting.current_balance,
+                            price,
+                            stop_loss,
+                            leverage,
+                            config.risk_per_trade,
+                            config.max_trade_allocation,
+                            filters,
+                        ) else {
+                            continue;
+                        };
+                        let portfolio_risk: f64 = still_active.iter().map(position_risk).sum();
+                        let max_risk_usd =
+                            state.accounting.current_balance * config.max_portfolio_risk;
+                        if portfolio_risk + new_risk > max_risk_usd || margin_usdt > free_margin {
+                            continue;
+                        }
+                        let quantity_text = exchange_quantity_text(quantity, filters);
+                        let current_id = state.next_position_id;
+                        state.next_position_id += 1;
+                        still_active.push(ActivePosition {
+                            id: current_id,
+                            symbol: t.symbol.clone(),
+                            side: side.to_string(),
+                            entry_price: price,
+                            current_price: price,
+                            stop_loss,
+                            take_profit,
+                            best_price: price,
+                            peak_pnl_percent: -FEE_RATE_PERCENT * leverage,
+                            leverage,
+                            margin_usdt,
+                            lifecycle: PositionLifecycle::PendingOpen,
+                            status: format!(
+                                "Risk kontrollü simüle emir: {} / risk USD {:.2}",
+                                side, new_risk
+                            ),
+                            pnl_percent: -FEE_RATE_PERCENT * leverage,
+                            pnl_usd: -(margin_usdt * FEE_RATE_PERCENT * leverage / 100.0),
+                            quantity: quantity_text.clone(),
+                            initial_quantity: quantity_text,
+                            tp1_price,
+                            tp2_price,
+                            tp_stage: 0,
+                            realized_pnl_usd: 0.0,
+                            atr: fifteen_minute.atr,
+                            opened_at: now,
+                            strategy_version: STRATEGY_VERSION.to_string(),
+                            entry_ema_fast: fifteen_minute.ema_fast,
+                            entry_ema_slow: fifteen_minute.ema_slow,
+                            entry_rsi: five_minute.rsi,
+                            entry_adx: fifteen_minute.adx,
+                            entry_obi: obi,
+                            entry_spread: spread,
+                            market_regime: market_regime.as_str().to_string(),
+                        });
+                    }
+                }
+
+                if state.accounting.starting_balance > 0.0 {
+                    state.accounting.total_roi = ((state.accounting.current_balance
+                        - state.accounting.starting_balance)
+                        / state.accounting.starting_balance)
+                        * 100.0;
+                }
+
+                if let Err(e) =
+                    atomic_batch_save(&db_conn, &newly_closed, &still_active, &state.accounting)
+                {
+                    if let Ok(mut locked_state) = shared_state.lock() {
+                        locked_state.last_error =
+                            format!("DB Batch Transaction Hatası: {e}; durum ilerletilmedi");
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+
+                for closed in &newly_closed {
+                    symbol_cooldowns.insert(closed.symbol.clone(), closed.closed_at);
+                    if closed.pnl_usd < 0.0 {
+                        consecutive_losses += 1;
+                    } else {
+                        consecutive_losses = 0;
+                    }
+                }
+
+                state.positions = still_active;
+
+                if let Ok((hist, tot_count, succ_count)) = load_history_from_db(&db_conn) {
+                    state.history = hist;
+                    state.accounting.closed_trades_count = tot_count;
+                    state.accounting.successful_trades = succ_count;
+                }
+                if let Ok(stats) = load_performance_stats(&db_conn) {
+                    state.stats = stats;
+                }
+
+                state.last_error = current_err;
+                if let Ok(mut locked_state) = shared_state.lock() {
+                    *locked_state = state;
+                }
+            }
+            Err(e) => {
+                if let Ok(mut state) = shared_state.lock() {
+                    state.last_error = format!("Ağ Hatası: {}", e);
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn render_dashboard(state: &AppState) -> String {
+    let roi_class = if state.accounting.total_roi >= 0.0 {
+        "positive"
+    } else {
+        "negative"
+    };
+    let win_rate = if state.accounting.closed_trades_count > 0 {
+        state.accounting.successful_trades as f64 / state.accounting.closed_trades_count as f64
+            * 100.0
+    } else {
+        0.0
+    };
+    let used_margin: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.margin_usdt)
+        .sum();
+    let open_pnl: f64 = state
+        .positions
+        .iter()
+        .map(|position| position.pnl_usd)
+        .sum();
+    let status_text = if state.last_error.contains("ENTRY_ENABLED") {
+        "Yeni işlemler kapalı"
+    } else {
+        &state.last_error
+    };
+    let status_class = if state.last_error.contains("Hata") {
+        "status danger"
+    } else if state.last_error.contains("ENTRY_ENABLED") {
+        "status warning"
+    } else {
+        "status healthy"
+    };
+    let balance_text = format_money(state.accounting.current_balance, false);
+    let roi_text = format_percent(state.accounting.total_roi, 2, true);
+    let open_pnl_text = format_money(open_pnl, true);
+    let used_margin_text = format_money(used_margin, false);
+    let win_rate_text = format_percent(win_rate, 1, false);
+    let profit_factor_text = format_tr_number(state.stats.profit_factor, 2, false);
+    let strategy_pnl_text = format_money(state.stats.strategy_pnl, true);
+
+    let mut html = format!(
+        r#"<!doctype html>
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="3"><title>Quant Futures</title>
+<style>
+:root{{--bg:#05070b;--glass:#111722d9;--glass2:#171f2d;--line:#293346;--text:#f4f7fb;--muted:#8290a7;--gold:#f8c246;--green:#14e6a0;--red:#ff4d6d;--blue:#5ba8ff}}
+*{{box-sizing:border-box}}html{{min-height:100%}}body{{margin:0;min-height:100vh;background:#05070b;color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;overflow-x:hidden}}
+body:before{{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(circle at 8% 0%,#17315970 0,transparent 32%),radial-gradient(circle at 92% 8%,#5b421f54 0,transparent 28%),linear-gradient(145deg,#05070b 0%,#0a1019 48%,#05070b 100%)}}
+body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-image:linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px);background-size:42px 42px;mask-image:linear-gradient(to bottom,#000,transparent 78%)}}
+.shell{{max-width:1540px;margin:auto;padding:28px 30px 44px;perspective:1400px}}.topbar{{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:24px;padding:14px 16px;border:1px solid #ffffff12;border-radius:18px;background:linear-gradient(135deg,#131a26dc,#090d14c7);box-shadow:0 18px 55px #0008,inset 0 1px #ffffff10;backdrop-filter:blur(18px)}}
+.brand{{display:flex;align-items:center;gap:14px}}.logo{{position:relative;width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,#ffe27a,#e7a900);color:#111;display:grid;place-items:center;font-weight:950;font-size:21px;box-shadow:0 12px 24px #0008,0 0 28px #f8c24638,inset 0 2px 2px #fff9,inset 0 -3px 5px #9e680077;transform:rotate(-3deg)}}
+.brand h1{{font-size:21px;margin:0;letter-spacing:.25px;text-shadow:0 2px 16px #000}}.brand p{{margin:4px 0 0;color:var(--muted);font-size:12px}}.top-actions{{display:flex;gap:10px;align-items:center}}
+.mode{{font-size:10px;color:#161000;background:linear-gradient(180deg,#ffd966,#e9aa08);font-weight:900;padding:8px 12px;border-radius:9px;letter-spacing:1px;box-shadow:0 7px 16px #0007,inset 0 1px #fff8}}
+.status{{display:flex;align-items:center;gap:9px;padding:11px 14px;border:1px solid #ffffff12;background:#0b111bd9;border-radius:11px;color:#9eabc0;font-size:12px;box-shadow:inset 0 1px #ffffff08,0 8px 20px #0005}}
+.status:before{{content:"";width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green),0 0 18px var(--green)}}.status.warning:before{{background:var(--gold);box-shadow:0 0 8px var(--gold),0 0 18px var(--gold)}}.status.danger:before{{background:var(--red);box-shadow:0 0 8px var(--red),0 0 18px var(--red)}}
+.stats{{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:14px;margin-bottom:30px}}.stat{{position:relative;overflow:hidden;background:linear-gradient(145deg,#192231e8,#0d131de8);border:1px solid #ffffff13;border-radius:16px;padding:17px 16px 18px;box-shadow:0 16px 32px #0007,inset 0 1px #ffffff10;transform:translateZ(0);transition:.25s ease}}
+
+.stat:before{{content:"";position:absolute;inset:0;background:linear-gradient(115deg,#ffffff0d,transparent 34%);pointer-events:none}}.stat:after{{content:"";position:absolute;left:15px;right:15px;bottom:0;height:2px;background:linear-gradient(90deg,transparent,var(--blue),transparent);opacity:.55}}.stat:hover{{transform:translateY(-5px) rotateX(3deg);border-color:#5ba8ff55;box-shadow:0 24px 42px #0009,0 0 22px #5ba8ff18,inset 0 1px #ffffff18}}
+.stat span{{display:block;color:#8696ad;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}}.stat strong{{font-size:20px;font-variant-numeric:tabular-nums;text-shadow:0 2px 14px #000}}
+
+.positive{{color:var(--green)!important;text-shadow:0 0 18px #14e6a033!important}}.negative{{color:var(--red)!important;text-shadow:0 0 18px #ff4d6d33!important}}.section-head{{display:flex;align-items:end;justify-content:space-between;margin:24px 2px 13px}}.section-head h2{{font-size:16px;margin:0;letter-spacing:.2px}}.section-head h2:after{{content:"";display:block;width:42px;height:3px;margin-top:8px;border-radius:3px;background:linear-gradient(90deg,var(--gold),transparent);box-shadow:0 0 12px #f8c24655}}.section-head span{{font-size:11px;color:var(--muted)}}
+.position-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(350px,1fr));gap:16px}}.position{{position:relative;overflow:hidden;background:linear-gradient(145deg,#182230f2,#0b111af2);border:1px solid #ffffff14;border-radius:18px;padding:19px;box-shadow:0 20px 38px #0009,inset 0 1px #ffffff12;transform-style:preserve-3d;transition:.25s ease}}
+.position:before{{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 90% 0%,var(--glow),transparent 40%),linear-gradient(115deg,#ffffff0c,transparent 35%)}}.position:after{{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;background:linear-gradient(90deg,transparent,var(--accent),transparent);box-shadow:0 0 18px var(--accent)}}.position:hover{{transform:translateY(-6px) rotateX(2deg) rotateY(-1deg);box-shadow:0 30px 50px #000b,0 0 28px var(--glow),inset 0 1px #ffffff18}}.position.long{{--accent:var(--green);--glow:#14e6a018;border-color:#14e6a044}}.position.short{{--accent:var(--red);--glow:#ff4d6d18;border-color:#ff4d6d44}}
 .position-top{{position:relative;display:flex;justify-content:space-between;align-items:start;margin-bottom:19px}}.symbol{{font-size:20px;font-weight:900;letter-spacing:.3px}}.side{{font-size:10px;font-weight:950;padding:6px 10px;border:1px solid currentColor;border-radius:7px;box-shadow:0 6px 16px #0007}}
 .long .side{{color:var(--green);background:#14e6a012}}.short .side{{color:var(--red);background:#ff4d6d12}}.position-meta{{color:var(--muted);font-size:11px;margin-top:5px}}.pnl{{text-align:right}}.pnl strong{{display:block;font-size:23px;font-variant-numeric:tabular-nums}}.pnl small{{color:var(--muted)}}.long .pnl strong{{color:var(--green);text-shadow:0 0 18px #14e6a040}}.short .pnl strong{{color:var(--red);text-shadow:0 0 18px #ff4d6d40}}
 .price-grid{{position:relative;display:grid;grid-template-columns:repeat(3,1fr);gap:9px;padding-top:14px;border-top:1px solid #ffffff10}}.price-grid div{{padding:9px 10px;border-radius:10px;background:#05091070;box-shadow:inset 0 1px 5px #0008,inset 0 1px #ffffff08}}.price-grid span{{color:var(--muted);font-size:9px;display:block;margin-bottom:5px;text-transform:uppercase;letter-spacing:.65px}}.price-grid b{{font-size:13px;font-variant-numeric:tabular-nums}}
