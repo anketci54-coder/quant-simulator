@@ -1396,17 +1396,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 if safety_allows_entries {
-                    let market_regime = fetch_fast_indicators(
-                        &client,
-                        &config,
-                        "BTCUSDT",
-                        "1h",
-                    )
-                    .map(|indicators| classify_market_regime(&indicators))
-                    .unwrap_or(MarketRegime::Sideways);
+                    let market_regime = fetch_fast_indicators(&client, &config, "BTCUSDT", "1h")
+                        .map(|indicators| classify_market_regime(&indicators))
+                        .unwrap_or(MarketRegime::Sideways);
                     if market_regime == MarketRegime::Sideways {
-                        current_err =
-                            "BTC 1s rejimi yatay: yeni girişler bekletiliyor".to_string();
+                        current_err = "BTC 1s rejimi yatay: yeni girişler bekletiliyor".to_string();
                     }
                     let mut candidates: Vec<&Ticker> = tickers
                         .iter()
@@ -1481,11 +1475,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             .collect::<Vec<_>>()
                     });
 
-                    for (t, obi, spread, one_minute, five_minute, fifteen_minute) in market_signals {
-                        let (Ok(vol), Ok(price)) = (
-                            t.quote_volume.parse::<f64>(),
-                            t.last_price.parse::<f64>(),
-                        ) else {
+                    for (t, obi, spread, one_minute, five_minute, fifteen_minute) in market_signals
+                    {
+                        let (Ok(vol), Ok(price)) =
+                            (t.quote_volume.parse::<f64>(), t.last_price.parse::<f64>())
+                        else {
                             continue;
                         };
                         if price <= 0.0 || vol < config.min_quote_volume {
@@ -1499,8 +1493,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if samples.len() < config.obi_confirmation_samples {
                             continue;
                         }
-                        let normalized_trend = (fifteen_minute.ema_fast
-                            - fifteen_minute.ema_slow)
+                        let normalized_trend = (fifteen_minute.ema_fast - fifteen_minute.ema_slow)
                             / fifteen_minute.atr;
                         let long_confirmed = market_regime == MarketRegime::Bull
                             && samples.iter().all(|value| *value >= 0.12)
@@ -1529,11 +1522,9 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         };
                         let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
                         let now = unix_timestamp();
-                        let cooling_down = symbol_cooldowns
-                            .get(&t.symbol)
-                            .is_some_and(|closed_at| {
-                                now.saturating_sub(*closed_at)
-                                    < config.cooldown.as_secs() as i64
+                        let cooling_down =
+                            symbol_cooldowns.get(&t.symbol).is_some_and(|closed_at| {
+                                now.saturating_sub(*closed_at) < config.cooldown.as_secs() as i64
                             });
                         if already_active
                             || cooling_down
