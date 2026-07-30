@@ -1,4 +1,3 @@
-
 use dotenvy::dotenv;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -79,7 +78,6 @@ fn calculate_trade_pnl(side: &str, entry: f64, exit: f64, quantity: f64) -> Opti
     };
     let fees = (entry + exit) * quantity * (FEE_RATE_PERCENT / 100.0);
     Some(gross - fees)
-
 }
 
 fn break_even_stop(side: &str, entry: f64) -> Option<f64> {
@@ -159,7 +157,6 @@ fn quantize_quantity(raw_qty: f64, filters: &SymbolFilters) -> Option<f64> {
         Some(qty)
     }
 }
-
 
 fn partial_quantity(
     initial_quantity: f64,
@@ -241,7 +238,6 @@ struct Depth {
 
 #[derive(Deserialize, Debug)]
 struct BookTicker {
-
     symbol: String,
     #[serde(rename = "bidPrice")]
     bid_price: String,
@@ -322,7 +318,6 @@ fn format_quantity(value: &str) -> String {
 }
 
 fn spread_percent(book: &BookTicker) -> Option<f64> {
-
     let bid = book.bid_price.parse::<f64>().ok()?;
     let ask = book.ask_price.parse::<f64>().ok()?;
     let mid = (bid + ask) / 2.0;
@@ -403,7 +398,6 @@ enum MarketRegime {
     Bull,
     Bear,
     Sideways,
-
 }
 
 impl MarketRegime {
@@ -484,7 +478,6 @@ fn init_db() -> Result<Connection, String> {
         "ALTER TABLE closed_trades ADD COLUMN market_regime TEXT NOT NULL DEFAULT 'LEGACY'",
     ] {
         let _ = conn.execute(migration, []);
-
     }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -565,7 +558,6 @@ fn load_or_create_daily_starting_balance(conn: &Mutex<Connection>, current_balan
             "SELECT value FROM kv_store WHERE key='risk_session_starting_balance'",
             [],
             |row| row.get::<_, String>(0),
-
         )
         .ok()
         .and_then(|value| value.parse::<f64>().ok());
@@ -646,7 +638,6 @@ fn atomic_batch_save(
         "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('starting_balance', ?1)",
         params![acc.starting_balance.to_string()],
     )
-
     .map_err(|e| e.to_string())?;
 
     tx.commit().map_err(|e| e.to_string())?;
@@ -727,7 +718,6 @@ fn load_history_from_db(
         .unwrap_or(0) as usize;
     let successful_count: usize = c
         .query_row(
-
             "SELECT COUNT(*) FROM closed_trades WHERE pnl_percent > 0",
             [],
             |row| row.get::<_, i64>(0),
@@ -808,7 +798,6 @@ fn load_accounting_from_db(conn: &Mutex<Connection>, default_starting: f64) -> D
     let mut date = "unknown".to_string();
     if let Ok(c) = conn.lock() {
         if let Ok(val) = c.query_row(
-
             "SELECT value FROM kv_store WHERE key='starting_balance'",
             [],
             |row| row.get::<_, String>(0),
@@ -889,7 +878,6 @@ fn fetch_symbol_filters(
                     );
                 }
                 break;
-
             }
         }
     }
@@ -970,7 +958,6 @@ fn calculate_fast_indicators(
 
     let true_ranges: Vec<f64> = (1..closes.len())
         .map(|index| {
-
             let high_low = highs[index] - lows[index];
             let high_close = (highs[index] - closes[index - 1]).abs();
             let low_close = (lows[index] - closes[index - 1]).abs();
@@ -1051,7 +1038,6 @@ fn fetch_fast_indicators(
     calculate_fast_indicators(&highs, &lows, &closes)
         .ok_or_else(|| format!("insufficient indicator data for {symbol}"))
 }
-
 
 fn classify_market_regime(indicators: &FastIndicators) -> MarketRegime {
     if indicators.adx < 18.0 {
@@ -1213,7 +1199,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                     pos.tp2_price = pos.entry_price - risk_distance * 2.0;
                                     pos.take_profit = pos.entry_price - risk_distance * 4.0;
                                 }
-
                             }
 
                             if let Some(filters) = symbol_filters.get(&pos.symbol) {
@@ -1242,9 +1227,8 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                             );
                                             if is_scalp {
                                                 pos.tp_stage = 2;
-                                                pos.status =
-                                                    "Scalp TP: %55 realize, kalan trendde"
-                                                        .to_string();
+                                                pos.status = "Scalp TP: %55 realize, kalan trendde"
+                                                    .to_string();
                                                 pos.stop_loss = pos.tp1_price;
                                             } else {
                                                 pos.tp_stage = 1;
@@ -1294,7 +1278,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                 let trail_atr = if pos.market_regime == "SIDEWAYS_SCALP" {
                                     1.4
                                 } else {
-
                                     2.5
                                 };
                                 let trail_distance =
@@ -1429,17 +1412,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 if safety_allows_entries {
-                    let market_regime = fetch_fast_indicators(
-                        &client,
-                        &config,
-                        "BTCUSDT",
-                        "1h",
-                    )
-                    .map(|indicators| classify_market_regime(&indicators))
-                    .unwrap_or(MarketRegime::Sideways);
+                    let market_regime = fetch_fast_indicators(&client, &config, "BTCUSDT", "1h")
+                        .map(|indicators| classify_market_regime(&indicators))
+                        .unwrap_or(MarketRegime::Sideways);
                     if market_regime == MarketRegime::Sideways {
-                        current_err =
-                            "BTC 1s yatay: seçici altcoin vur-kaç modu aktif".to_string();
+                        current_err = "BTC 1s yatay: seçici altcoin vur-kaç modu aktif".to_string();
                     }
                     let mut candidates: Vec<&Ticker> = tickers
                         .iter()
@@ -1512,11 +1489,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             .collect::<Vec<_>>()
                     });
 
-                    for (t, obi, spread, one_minute, five_minute, fifteen_minute) in market_signals {
-                        let (Ok(vol), Ok(price)) = (
-                            t.quote_volume.parse::<f64>(),
-                            t.last_price.parse::<f64>(),
-                        ) else {
+                    for (t, obi, spread, one_minute, five_minute, fifteen_minute) in market_signals
+                    {
+                        let (Ok(vol), Ok(price)) =
+                            (t.quote_volume.parse::<f64>(), t.last_price.parse::<f64>())
+                        else {
                             continue;
                         };
                         if price <= 0.0 || vol < config.min_quote_volume {
@@ -1530,14 +1507,12 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if samples.len() < config.obi_confirmation_samples {
                             continue;
                         }
-                        let normalized_trend = (fifteen_minute.ema_fast
-                            - fifteen_minute.ema_slow)
+                        let normalized_trend = (fifteen_minute.ema_fast - fifteen_minute.ema_slow)
                             / fifteen_minute.atr;
                         let long_confirmed = market_regime == MarketRegime::Bull
                             && samples.iter().all(|value| *value >= 0.12)
                             && normalized_trend >= 0.05
                             && fifteen_minute.adx >= 20.0
-
                             && five_minute.ema_fast > five_minute.ema_slow
                             && five_minute.adx >= 18.0
                             && (52.0..=72.0).contains(&five_minute.rsi)
@@ -1583,11 +1558,9 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         };
                         let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
                         let now = unix_timestamp();
-                        let cooling_down = symbol_cooldowns
-                            .get(&t.symbol)
-                            .is_some_and(|closed_at| {
-                                now.saturating_sub(*closed_at)
-                                    < config.cooldown.as_secs() as i64
+                        let cooling_down =
+                            symbol_cooldowns.get(&t.symbol).is_some_and(|closed_at| {
+                                now.saturating_sub(*closed_at) < config.cooldown.as_secs() as i64
                             });
                         if already_active
                             || cooling_down
@@ -1616,8 +1589,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         } else {
                             (fifteen_minute.atr * 1.8).clamp(price * 0.006, price * 0.03)
                         };
-                        let (tp1_r, tp2_r, runner_r) =
-                            if is_scalp { (1.25, 2.25, 3.5) } else { (1.0, 2.0, 4.0) };
+                        let (tp1_r, tp2_r, runner_r) = if is_scalp {
+                            (1.25, 2.25, 3.5)
+                        } else {
+                            (1.0, 2.0, 4.0)
+                        };
 
                         let (stop_loss, tp1_price, tp2_price, take_profit) = if side == "LONG" {
                             (
@@ -1637,8 +1613,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         let Some(filters) = symbol_filters.get(&t.symbol) else {
                             continue;
                         };
-                        let trend_quality =
-                            ((fifteen_minute.adx - 18.0) / 22.0).clamp(0.0, 1.0);
+                        let trend_quality = ((fifteen_minute.adx - 18.0) / 22.0).clamp(0.0, 1.0);
                         let obi_quality = (obi.abs() / 0.30).clamp(0.0, 1.0);
                         let confirmation_quality =
                             ((five_minute.adx - 18.0) / 18.0).clamp(0.0, 1.0);
@@ -1779,7 +1754,6 @@ fn escape_html(value: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
 }
-
 
 fn render_dashboard(state: &AppState) -> String {
     let roi_class = if state.accounting.total_roi >= 0.0 {
@@ -2104,7 +2078,6 @@ mod tests {
 
     #[test]
     fn pnl_is_symmetric_for_long_and_short() {
-
         let long = calculate_pnl_percent("LONG", 100.0, 101.0, 3.0).unwrap();
         let short = calculate_pnl_percent("SHORT", 100.0, 99.0, 3.0).unwrap();
         assert!((long - short).abs() < 1e-9);
