@@ -1,0 +1,24 @@
+name: Capture Clippy
+on:
+  push:
+    branches: [agent/multi-timeframe-strategy-v3]
+permissions:
+  contents: write
+jobs:
+  capture:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/multi-timeframe-strategy-v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings > clippy.log 2>&1 || true
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add clippy.log
+          git commit -m 'chore: capture clippy diagnostics'
+          git push origin HEAD:agent/multi-timeframe-strategy-v3
