@@ -1,4 +1,3 @@
-
 #[derive(Clone, Copy, Debug)]
 pub struct OutcomeStats {
     pub wins: u64,
