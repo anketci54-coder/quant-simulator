@@ -1,11 +1,11 @@
-name: Capture Clippy
+name: Fix Clippy
 on:
   push:
     branches: [agent/multi-timeframe-strategy-v3]
 permissions:
   contents: write
 jobs:
-  capture:
+  fix:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -14,11 +14,12 @@ jobs:
           ref: agent/multi-timeframe-strategy-v3
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
-      - run: cargo clippy --all-targets -- -D warnings > clippy.log 2>&1 || true
+          components: rustfmt
+      - run: sed -i '/price_change_percent: String,/d' src/main.rs
+      - run: cargo fmt --all
       - run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add clippy.log
-          git commit -m 'chore: capture clippy diagnostics'
+          git add src/main.rs
+          git commit -m 'fix: remove obsolete ticker change field'
           git push origin HEAD:agent/multi-timeframe-strategy-v3
