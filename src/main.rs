@@ -224,8 +224,6 @@ impl Config {
 #[derive(Deserialize, Debug, Clone)]
 struct Ticker {
     symbol: String,
-    #[serde(rename = "priceChangePercent")]
-    price_change_percent: String,
     #[serde(rename = "quoteVolume")]
     quote_volume: String,
     #[serde(rename = "lastPrice")]
