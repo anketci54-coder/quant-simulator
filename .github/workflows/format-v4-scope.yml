@@ -1,0 +1,24 @@
+name: Format V4 Scope
+on:
+  push:
+    branches: [agent/mtf-v4-mass-market]
+permissions:
+  contents: write
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/mtf-v4-mass-market
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src
+          git diff --cached --quiet || git commit -m 'style: format simplified V4 scope'
+          git push origin HEAD:agent/mtf-v4-mass-market
