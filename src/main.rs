@@ -1118,6 +1118,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 let mut still_active = Vec::new();
                 let mut current_err =
                     String::from("Sistem Kararlı Çalışıyor (Risk Kontrollü Simülasyon Modu)");
+
                 let mut batch_realized_pnl = 0.0;
 
                 for mut pos in state.positions {
@@ -1201,13 +1202,15 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             }
 
                             if let Some(filters) = symbol_filters.get(&pos.symbol) {
+                                let is_scalp = pos.market_regime == "SIDEWAYS_SCALP";
                                 let tp1_hit = (pos.side == "LONG" && curr_price >= pos.tp1_price)
                                     || (pos.side == "SHORT" && curr_price <= pos.tp1_price);
                                 if pos.tp_stage == 0 && tp1_hit {
+                                    let first_take_fraction = if is_scalp { 0.55 } else { 0.30 };
                                     if let Some(close_quantity) = partial_quantity(
                                         initial_quantity,
                                         remaining_quantity,
-                                        0.30,
+                                        first_take_fraction,
                                         filters,
                                     ) {
                                         if let Some(partial_pnl) = calculate_trade_pnl(
@@ -1222,12 +1225,20 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                                 remaining_quantity.max(0.0),
                                                 filters,
                                             );
-                                            pos.tp_stage = 1;
-                                            pos.status = "TP1: %30 kâr realize edildi".to_string();
-                                            if let Some(stop) =
-                                                break_even_stop(&pos.side, pos.entry_price)
-                                            {
-                                                pos.stop_loss = stop;
+                                            if is_scalp {
+                                                pos.tp_stage = 2;
+                                                pos.status = "Scalp TP: %55 realize, kalan trendde"
+                                                    .to_string();
+                                                pos.stop_loss = pos.tp1_price;
+                                            } else {
+                                                pos.tp_stage = 1;
+                                                pos.status =
+                                                    "TP1: %30 kâr realize edildi".to_string();
+                                                if let Some(stop) =
+                                                    break_even_stop(&pos.side, pos.entry_price)
+                                                {
+                                                    pos.stop_loss = stop;
+                                                }
                                             }
                                         }
                                     }
@@ -1264,7 +1275,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             }
 
                             if pos.tp_stage >= 2 {
-                                let trail_distance = (pos.atr * 2.5).max(pos.entry_price * 0.004);
+                                let trail_atr = if pos.market_regime == "SIDEWAYS_SCALP" {
+                                    1.4
+                                } else {
+                                    2.5
+                                };
+                                let trail_distance =
+                                    (pos.atr * trail_atr).max(pos.entry_price * 0.004);
                                 if pos.side == "LONG" {
                                     let trailed_stop = pos.best_price - trail_distance;
                                     if trailed_stop > pos.stop_loss {
@@ -1341,6 +1358,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                     symbol: pos.symbol.clone(),
                                     side: pos.side.clone(),
                                     entry_price: pos.entry_price,
+
                                     exit_price: curr_price,
                                     status: reason,
                                     pnl_percent: total_pnl_percent,
@@ -1398,7 +1416,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         .map(|indicators| classify_market_regime(&indicators))
                         .unwrap_or(MarketRegime::Sideways);
                     if market_regime == MarketRegime::Sideways {
-                        current_err = "BTC 1s rejimi yatay: yeni girişler bekletiliyor".to_string();
+                        current_err = "BTC 1s yatay: seçici altcoin vur-kaç modu aktif".to_string();
                     }
                     let mut candidates: Vec<&Ticker> = tickers
                         .iter()
@@ -1415,10 +1433,8 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         let right_volume = right.quote_volume.parse::<f64>().unwrap_or(0.0);
                         right_volume.total_cmp(&left_volume)
                     });
+
                     candidates.truncate(config.max_signal_candidates);
-                    if market_regime == MarketRegime::Sideways {
-                        candidates.clear();
-                    }
 
                     let market_signals = thread::scope(|scope| {
                         let http_client = &client;
@@ -1511,10 +1527,32 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             && (28.0..=48.0).contains(&five_minute.rsi)
                             && one_minute.ema_fast <= one_minute.ema_slow
                             && (25.0..=52.0).contains(&one_minute.rsi);
-                        let (side, leverage) = if long_confirmed {
-                            ("LONG", 3.0)
+                        let scalp_long = market_regime == MarketRegime::Sideways
+                            && samples.iter().all(|value| *value >= 0.18)
+                            && normalized_trend >= 0.10
+                            && fifteen_minute.adx >= 25.0
+                            && five_minute.ema_fast > five_minute.ema_slow
+                            && five_minute.adx >= 22.0
+                            && (55.0..=76.0).contains(&five_minute.rsi)
+                            && one_minute.ema_fast >= one_minute.ema_slow
+                            && (52.0..=78.0).contains(&one_minute.rsi);
+                        let scalp_short = market_regime == MarketRegime::Sideways
+                            && samples.iter().all(|value| *value <= -0.18)
+                            && normalized_trend <= -0.10
+                            && fifteen_minute.adx >= 25.0
+                            && five_minute.ema_fast < five_minute.ema_slow
+                            && five_minute.adx >= 22.0
+                            && (24.0..=45.0).contains(&five_minute.rsi)
+                            && one_minute.ema_fast <= one_minute.ema_slow
+                            && (22.0..=48.0).contains(&one_minute.rsi);
+                        let (side, leverage, is_scalp) = if long_confirmed {
+                            ("LONG", 3.0, false)
                         } else if short_confirmed {
-                            ("SHORT", 3.0)
+                            ("SHORT", 3.0, false)
+                        } else if scalp_long {
+                            ("LONG", 3.0, true)
+                        } else if scalp_short {
+                            ("SHORT", 3.0, true)
                         } else {
                             continue;
                         };
@@ -1546,33 +1584,55 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if free_margin <= 0.0 {
                             continue;
                         }
-                        let stop_distance =
-                            (fifteen_minute.atr * 1.8).clamp(price * 0.006, price * 0.03);
+                        let stop_distance = if is_scalp {
+                            (fifteen_minute.atr * 1.25).clamp(price * 0.004, price * 0.018)
+                        } else {
+                            (fifteen_minute.atr * 1.8).clamp(price * 0.006, price * 0.03)
+                        };
+                        let (tp1_r, tp2_r, runner_r) = if is_scalp {
+                            (1.25, 2.25, 3.5)
+                        } else {
+                            (1.0, 2.0, 4.0)
+                        };
+
                         let (stop_loss, tp1_price, tp2_price, take_profit) = if side == "LONG" {
                             (
                                 price - stop_distance,
-                                price + stop_distance,
-                                price + stop_distance * 2.0,
-                                price + stop_distance * 4.0,
+                                price + stop_distance * tp1_r,
+                                price + stop_distance * tp2_r,
+                                price + stop_distance * runner_r,
                             )
                         } else {
                             (
                                 price + stop_distance,
-                                price - stop_distance,
-                                price - stop_distance * 2.0,
-                                price - stop_distance * 4.0,
+                                price - stop_distance * tp1_r,
+                                price - stop_distance * tp2_r,
+                                price - stop_distance * runner_r,
                             )
                         };
                         let Some(filters) = symbol_filters.get(&t.symbol) else {
                             continue;
+                        };
+                        let trend_quality = ((fifteen_minute.adx - 18.0) / 22.0).clamp(0.0, 1.0);
+                        let obi_quality = (obi.abs() / 0.30).clamp(0.0, 1.0);
+                        let confirmation_quality =
+                            ((five_minute.adx - 18.0) / 18.0).clamp(0.0, 1.0);
+                        let confidence = (trend_quality * 0.45
+                            + obi_quality * 0.35
+                            + confirmation_quality * 0.20)
+                            .clamp(if is_scalp { 0.35 } else { 0.55 }, 1.0);
+                        let allocation_scale = if is_scalp {
+                            0.35 + confidence * 0.35
+                        } else {
+                            0.65 + confidence * 0.35
                         };
                         let Some((quantity, margin_usdt, new_risk)) = calculate_position_size(
                             state.accounting.current_balance,
                             price,
                             stop_loss,
                             leverage,
-                            config.risk_per_trade,
-                            config.max_trade_allocation,
+                            config.risk_per_trade * confidence,
+                            config.max_trade_allocation * allocation_scale,
                             filters,
                         ) else {
                             continue;
@@ -1600,8 +1660,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             margin_usdt,
                             lifecycle: PositionLifecycle::PendingOpen,
                             status: format!(
-                                "Risk kontrollü simüle emir: {} / risk USD {:.2}",
-                                side, new_risk
+                                "{}: {} / güven {:.0}% / risk USD {:.2}",
+                                if is_scalp { "Vur-kaç" } else { "Trend" },
+                                side,
+                                confidence * 100.0,
+                                new_risk
                             ),
                             pnl_percent: -FEE_RATE_PERCENT * leverage,
                             pnl_usd: -(margin_usdt * FEE_RATE_PERCENT * leverage / 100.0),
@@ -1611,6 +1674,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             tp2_price,
                             tp_stage: 0,
                             realized_pnl_usd: 0.0,
+
                             atr: fifteen_minute.atr,
                             opened_at: now,
                             strategy_version: STRATEGY_VERSION.to_string(),
@@ -1620,7 +1684,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             entry_adx: fifteen_minute.adx,
                             entry_obi: obi,
                             entry_spread: spread,
-                            market_regime: market_regime.as_str().to_string(),
+                            market_regime: if is_scalp {
+                                "SIDEWAYS_SCALP".to_string()
+                            } else {
+                                market_regime.as_str().to_string()
+                            },
                         });
                     }
                 }
@@ -1767,6 +1835,7 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
 <div class="stat"><span>Açık Kâr / Zarar</span><strong class="{open_class}">{open_pnl} USDT</strong></div>
 <div class="stat"><span>Kullanılan Marjin</span><strong>{used_margin} USDT</strong></div>
 <div class="stat"><span>Başarı Oranı</span><strong>{win_rate}</strong></div>
+
 <div class="stat"><span>Kâr Faktörü</span><strong>{pf}</strong></div></section>
 <div class="section-head"><h2>Açık Pozisyonlar</h2><span>{strategy} · {strategy_count}/100 işlem · PnL {strategy_pnl} USDT · {position_count} pozisyon</span></div><section class="position-grid">"#,
         status_class = status_class,
@@ -1847,6 +1916,7 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
                 r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{strategy}<br><small>{regime}</small></td><td>{entry}</td><td>{exit}</td><td>{exit_stage}: {status}</td><td>{max_pnl}</td><td class="{pnl_class}">{pnl_percent}</td><td class="{pnl_class}">{pnl_usd} USDT</td></tr>"#,
                 id=trade.id,symbol=escape_html(&trade.symbol),side_class=side_class,side=escape_html(&trade.side),
                 strategy=escape_html(&trade.strategy_version),regime=escape_html(&trade.market_regime),
+
                 entry=format_price(trade.entry_price),exit=format_price(trade.exit_price),status=escape_html(&trade.status),
                 exit_stage=escape_html(&trade.exit_stage),max_pnl=format_percent(trade.max_pnl_percent, 2, true),
                 pnl_class=pnl_class,pnl_percent=format_percent(trade.pnl_percent, 2, true),pnl_usd=format_money(trade.pnl_usd, true)
@@ -1927,6 +1997,7 @@ fn main() {
     };
     let db = match init_db() {
         Ok(db) => db,
+
         Err(e) => {
             eprintln!("{e}");
             return;
@@ -2087,6 +2158,7 @@ mod tests {
     fn symbol_filter_rejects_testnet_noise() {
         assert!(is_tradeable_usdt_symbol("BTCUSDT"));
         assert!(is_tradeable_usdt_symbol("1000PEPEUSDT"));
+
         assert!(!is_tradeable_usdt_symbol("我踏马来了USDT"));
         assert!(!is_tradeable_usdt_symbol("BTC-USDT"));
         assert!(!is_tradeable_usdt_symbol("USDT"));
