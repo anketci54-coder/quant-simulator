@@ -1,4 +1,3 @@
-
 use crate::model::Candidate;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,11 +33,8 @@ pub fn size_candidate(
     let risk_budget = balance * limits.risk_fraction * confidence;
     let risk_quantity = risk_budget / candidate.stop_distance;
     let allocation_scale = 0.35 + confidence * 0.35;
-    let allocation_quantity = balance
-        * limits.allocation_fraction
-        * allocation_scale
-        * limits.leverage
-        / candidate.price;
+    let allocation_quantity =
+        balance * limits.allocation_fraction * allocation_scale * limits.leverage / candidate.price;
     let liquidity_quantity = candidate.liquidity_notional.max(0.0) * 0.05 / candidate.price;
     let raw = risk_quantity
         .min(allocation_quantity)

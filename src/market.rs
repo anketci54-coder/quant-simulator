@@ -1,4 +1,3 @@
-
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
@@ -69,7 +68,6 @@ impl Universe {
                 || symbol.quote_asset != "USDT"
                 || !is_safe_symbol(&symbol.symbol)
             {
-
                 continue;
             }
             let mut meta = SymbolMeta {
@@ -176,10 +174,12 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
             if !universe.contains(&ticker.symbol) {
                 continue;
             }
-            let mut state = store.entry(ticker.symbol.clone()).or_insert_with(|| SymbolState {
-                symbol: ticker.symbol.clone(),
-                ..SymbolState::default()
-            });
+            let mut state = store
+                .entry(ticker.symbol.clone())
+                .or_insert_with(|| SymbolState {
+                    symbol: ticker.symbol.clone(),
+                    ..SymbolState::default()
+                });
             state.last_price = ticker.close;
             state.quote_volume = ticker.quote_volume;
             state.event_time = ticker.event_time;
@@ -197,13 +197,12 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
         };
         for ticker in tickers {
             if universe.contains(&ticker.symbol) {
-                let mut state =
-                    store
-                        .entry(ticker.symbol.clone())
-                        .or_insert_with(|| SymbolState {
-                            symbol: ticker.symbol.clone(),
-                            ..SymbolState::default()
-                        });
+                let mut state = store
+                    .entry(ticker.symbol.clone())
+                    .or_insert_with(|| SymbolState {
+                        symbol: ticker.symbol.clone(),
+                        ..SymbolState::default()
+                    });
                 state.bid = ticker.bid;
                 state.ask = ticker.ask;
                 state.bid_quantity = ticker.bid_quantity;
@@ -211,7 +210,6 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
                 state.event_time = state.event_time.max(ticker.event_time);
             }
         }
-
     }
     Ok(())
 }

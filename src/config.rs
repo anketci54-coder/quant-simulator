@@ -1,4 +1,3 @@
-
 use std::{env, net::SocketAddr, time::Duration};
 
 use anyhow::{bail, Context, Result};
@@ -26,8 +25,7 @@ impl Config {
             rest_base_url: env::var("BINANCE_BASE_URL")
                 .unwrap_or_else(|_| "https://fapi.binance.com".to_string()),
             websocket_url: env::var("BINANCE_WS_URL").unwrap_or_else(|_| {
-                "wss://fstream.binance.com/stream?streams=!miniTicker@arr/!bookTicker"
-                    .to_string()
+                "wss://fstream.binance.com/stream?streams=!miniTicker@arr/!bookTicker".to_string()
             }),
             panel_bind: env::var("PANEL_BIND")
                 .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -68,7 +66,6 @@ impl Config {
         Ok(())
     }
 }
-
 
 fn parse<T>(name: &str, default: T) -> Result<T>
 where

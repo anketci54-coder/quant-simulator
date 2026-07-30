@@ -1,4 +1,3 @@
-
 use std::future::Future;
 
 use anyhow::Result;
@@ -11,10 +10,7 @@ pub struct OnChainContext {
 }
 
 pub trait OnChainProvider: Send + Sync {
-    fn context(
-        &self,
-        symbol: &str,
-    ) -> impl Future<Output = Result<Option<OnChainContext>>> + Send;
+    fn context(&self, symbol: &str) -> impl Future<Output = Result<Option<OnChainContext>>> + Send;
 }
 
 #[derive(Clone, Copy, Debug, Default)]

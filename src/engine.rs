@@ -1,4 +1,3 @@
-
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -64,8 +63,8 @@ fn calculate_features(state: &SymbolState, now: i64) -> FeatureSnapshot {
         0.0
     };
     let book = normalized(book_imbalance.abs(), 0.05, 0.60);
-    let cheap_score = (momentum * 25.0 + volume * 25.0 + liquidity * 25.0 + book * 25.0)
-        .clamp(0.0, 100.0);
+    let cheap_score =
+        (momentum * 25.0 + volume * 25.0 + liquidity * 25.0 + book * 25.0).clamp(0.0, 100.0);
     FeatureSnapshot {
         return_15s,
         return_60s,
@@ -90,9 +89,8 @@ fn candidate_from(config: &Config, state: &SymbolState, now: i64) -> Option<Cand
     {
         return None;
     }
-    let direction = features.return_15s * 0.5
-        + features.return_60s * 0.35
-        + features.book_imbalance * 0.15;
+    let direction =
+        features.return_15s * 0.5 + features.return_60s * 0.35 + features.book_imbalance * 0.15;
     let side = if direction > 0.0 {
         Side::Long
     } else {
@@ -107,8 +105,7 @@ fn candidate_from(config: &Config, state: &SymbolState, now: i64) -> Option<Cand
         score: features.cheap_score,
         confidence,
         stop_distance: state.last_price * stop_percent,
-        liquidity_notional: (state.bid * state.bid_quantity)
-            .min(state.ask * state.ask_quantity),
+        liquidity_notional: (state.bid * state.bid_quantity).min(state.ask * state.ask_quantity),
         observed_at: now,
         features,
     })
@@ -140,7 +137,6 @@ fn volume_impulse(state: &SymbolState, threshold: i64) -> f64 {
     base.map(|sample| {
         ((latest.quote_volume - sample.quote_volume) / latest.quote_volume.max(1.0)).max(0.0)
     })
-
     .unwrap_or_default()
 }
 
@@ -211,7 +207,6 @@ mod tests {
 
     fn candidate(symbol: &str, score: f64, observed_at: i64) -> Candidate {
         Candidate {
-
             symbol: symbol.to_string(),
             side: Side::Long,
             price: 1.0,

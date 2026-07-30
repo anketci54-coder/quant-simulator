@@ -1,4 +1,3 @@
-
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
@@ -68,7 +67,6 @@ pub struct FeatureSnapshot {
     pub cheap_score: f64,
     pub updated_at: i64,
 }
-
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Candidate {
