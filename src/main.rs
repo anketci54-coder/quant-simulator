@@ -5,11 +5,19 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tiny_http::{Response, Server};
 
 const FEE_RATE_PERCENT: f64 = 0.04;
 const BREAKEVEN_BUFFER_RATE: f64 = 0.001;
+const STRATEGY_VERSION: &str = "MTF_V3";
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug)]
 struct SymbolFilters {
@@ -76,6 +84,24 @@ fn break_even_stop(side: &str, entry: f64) -> Option<f64> {
     match side {
         "LONG" => Some(entry * (1.0 + BREAKEVEN_BUFFER_RATE)),
         "SHORT" => Some(entry * (1.0 - BREAKEVEN_BUFFER_RATE)),
+        _ => None,
+    }
+}
+
+fn protected_profit_stop(
+    side: &str,
+    entry: f64,
+    leverage: f64,
+    target_margin_percent: f64,
+) -> Option<f64> {
+    if entry <= 0.0 || leverage <= 0.0 {
+        return None;
+    }
+    let round_trip_fee_percent = FEE_RATE_PERCENT * leverage * 2.0;
+    let raw_move = (target_margin_percent + round_trip_fee_percent) / (leverage * 100.0);
+    match side {
+        "LONG" => Some(entry * (1.0 + raw_move)),
+        "SHORT" => Some(entry * (1.0 - raw_move)),
         _ => None,
     }
 }
@@ -198,8 +224,6 @@ impl Config {
 #[derive(Deserialize, Debug, Clone)]
 struct Ticker {
     symbol: String,
-    #[serde(rename = "priceChangePercent")]
-    price_change_percent: String,
     #[serde(rename = "quoteVolume")]
     quote_volume: String,
     #[serde(rename = "lastPrice")]
@@ -328,6 +352,15 @@ struct ActivePosition {
     tp_stage: u8,
     realized_pnl_usd: f64,
     atr: f64,
+    opened_at: i64,
+    strategy_version: String,
+    entry_ema_fast: f64,
+    entry_ema_slow: f64,
+    entry_rsi: f64,
+    entry_adx: f64,
+    entry_obi: f64,
+    entry_spread: f64,
+    market_regime: String,
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -342,6 +375,13 @@ struct ClosedPosition {
     pnl_usd: f64,
     max_pnl_percent: f64,
     exit_stage: String,
+    opened_at: i64,
+    closed_at: i64,
+    strategy_version: String,
+    entry_rsi: f64,
+    entry_adx: f64,
+    entry_obi: f64,
+    market_regime: String,
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +390,24 @@ struct FastIndicators {
     ema_slow: f64,
     rsi: f64,
     atr: f64,
+    adx: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MarketRegime {
+    Bull,
+    Bear,
+    Sideways,
+}
+
+impl MarketRegime {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bull => "BULL",
+            Self::Bear => "BEAR",
+            Self::Sideways => "SIDEWAYS",
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Debug)]
@@ -366,6 +424,8 @@ struct DailyAccounting {
 struct PerformanceStats {
     profit_factor: f64,
     expectancy: f64,
+    strategy_trade_count: usize,
+    strategy_pnl: f64,
 }
 
 #[derive(Clone)]
@@ -400,6 +460,22 @@ fn init_db() -> Result<Connection, String> {
         "ALTER TABLE active_positions ADD COLUMN tp_stage INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE active_positions ADD COLUMN realized_pnl_usd REAL NOT NULL DEFAULT 0",
         "ALTER TABLE active_positions ADD COLUMN atr REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN opened_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN strategy_version TEXT NOT NULL DEFAULT 'LEGACY'",
+        "ALTER TABLE active_positions ADD COLUMN entry_ema_fast REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN entry_ema_slow REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN entry_rsi REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN entry_adx REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN entry_obi REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN entry_spread REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE active_positions ADD COLUMN market_regime TEXT NOT NULL DEFAULT 'LEGACY'",
+        "ALTER TABLE closed_trades ADD COLUMN opened_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE closed_trades ADD COLUMN closed_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE closed_trades ADD COLUMN strategy_version TEXT NOT NULL DEFAULT 'LEGACY'",
+        "ALTER TABLE closed_trades ADD COLUMN entry_rsi REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE closed_trades ADD COLUMN entry_adx REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE closed_trades ADD COLUMN entry_obi REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE closed_trades ADD COLUMN market_regime TEXT NOT NULL DEFAULT 'LEGACY'",
     ] {
         let _ = conn.execute(migration, []);
     }
@@ -408,6 +484,11 @@ fn init_db() -> Result<Connection, String> {
         [],
     )
     .map_err(|e| format!("kv_store şeması oluşturulamadı: {e}"))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS symbol_cooldowns (symbol TEXT PRIMARY KEY, closed_at INTEGER NOT NULL)",
+        [],
+    )
+    .map_err(|e| format!("symbol_cooldowns şeması oluşturulamadı: {e}"))?;
     Ok(conn)
 }
 
@@ -498,6 +579,21 @@ fn load_or_create_daily_starting_balance(conn: &Mutex<Connection>, current_balan
     current_balance
 }
 
+fn load_symbol_cooldowns(conn: &Mutex<Connection>) -> HashMap<String, i64> {
+    let Ok(c) = conn.lock() else {
+        return HashMap::new();
+    };
+    let Ok(mut statement) = c.prepare("SELECT symbol, closed_at FROM symbol_cooldowns") else {
+        return HashMap::new();
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) else {
+        return HashMap::new();
+    };
+    rows.filter_map(Result::ok).collect()
+}
+
 fn atomic_batch_save(
     conn: &Mutex<Connection>,
     closed_list: &[ClosedPosition],
@@ -509,9 +605,14 @@ fn atomic_batch_save(
 
     for h in closed_list {
         tx.execute(
-            "INSERT OR IGNORE INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd, h.max_pnl_percent, h.exit_stage.clone()],
+            "INSERT OR IGNORE INTO closed_trades (id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage, opened_at, closed_at, strategy_version, entry_rsi, entry_adx, entry_obi, market_regime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![h.id as i64, h.symbol.clone(), h.side.clone(), h.entry_price, h.exit_price, h.status.clone(), h.pnl_percent, h.pnl_usd, h.max_pnl_percent, h.exit_stage.clone(), h.opened_at, h.closed_at, h.strategy_version.clone(), h.entry_rsi, h.entry_adx, h.entry_obi, h.market_regime.clone()],
         ).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO symbol_cooldowns (symbol, closed_at) VALUES (?1, ?2)",
+            params![h.symbol.clone(), h.closed_at],
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     tx.execute("DELETE FROM active_positions", [])
@@ -523,8 +624,8 @@ fn atomic_batch_save(
             PositionLifecycle::Closed => "Closed",
         };
         tx.execute(
-            "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
-            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone(), p.initial_quantity.clone(), p.tp1_price, p.tp2_price, p.tp_stage as i64, p.realized_pnl_usd, p.atr],
+            "INSERT INTO active_positions (id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr, opened_at, strategy_version, entry_ema_fast, entry_ema_slow, entry_rsi, entry_adx, entry_obi, entry_spread, market_regime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)",
+            params![p.id as i64, p.symbol.clone(), p.side.clone(), p.entry_price, p.current_price, p.stop_loss, p.take_profit, p.best_price, p.peak_pnl_percent, p.leverage, p.margin_usdt, lc_str, p.status.clone(), p.pnl_percent, p.pnl_usd, p.quantity.clone(), p.initial_quantity.clone(), p.tp1_price, p.tp2_price, p.tp_stage as i64, p.realized_pnl_usd, p.atr, p.opened_at, p.strategy_version.clone(), p.entry_ema_fast, p.entry_ema_slow, p.entry_rsi, p.entry_adx, p.entry_obi, p.entry_spread, p.market_regime.clone()],
         ).map_err(|e| e.to_string())?;
     }
 
@@ -546,7 +647,7 @@ fn atomic_batch_save(
 fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActivePosition>, String> {
     let mut positions = Vec::new();
     let c = conn.lock().map_err(|e| e.to_string())?;
-    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr FROM active_positions").map_err(|e| e.to_string())?;
+    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, current_price, stop_loss, take_profit, best_price, peak_pnl_percent, leverage, margin_usdt, lifecycle, status, pnl_percent, pnl_usd, quantity, initial_quantity, tp1_price, tp2_price, tp_stage, realized_pnl_usd, atr, opened_at, strategy_version, entry_ema_fast, entry_ema_slow, entry_rsi, entry_adx, entry_obi, entry_spread, market_regime FROM active_positions").map_err(|e| e.to_string())?;
     let iter = stmt
         .query_map([], |row| {
             let lc_str: String = row.get(11)?;
@@ -586,6 +687,15 @@ fn load_active_positions_from_db(conn: &Mutex<Connection>) -> Result<Vec<ActiveP
                 tp_stage: row.get::<_, i64>(19)? as u8,
                 realized_pnl_usd: row.get(20)?,
                 atr: row.get(21)?,
+                opened_at: row.get(22)?,
+                strategy_version: row.get(23)?,
+                entry_ema_fast: row.get(24)?,
+                entry_ema_slow: row.get(25)?,
+                entry_rsi: row.get(26)?,
+                entry_adx: row.get(27)?,
+                entry_obi: row.get(28)?,
+                entry_spread: row.get(29)?,
+                market_regime: row.get(30)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -614,7 +724,7 @@ fn load_history_from_db(
         )
         .unwrap_or(0) as usize;
 
-    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
+    let mut stmt = c.prepare("SELECT id, symbol, side, entry_price, exit_price, status, pnl_percent, pnl_usd, max_pnl_percent, exit_stage, opened_at, closed_at, strategy_version, entry_rsi, entry_adx, entry_obi, market_regime FROM closed_trades ORDER BY id DESC LIMIT 50").map_err(|e| e.to_string())?;
     let iter = stmt
         .query_map([], |row| {
             Ok(ClosedPosition {
@@ -628,6 +738,13 @@ fn load_history_from_db(
                 pnl_usd: row.get(7)?,
                 max_pnl_percent: row.get(8)?,
                 exit_stage: row.get(9)?,
+                opened_at: row.get(10)?,
+                closed_at: row.get(11)?,
+                strategy_version: row.get(12)?,
+                entry_rsi: row.get(13)?,
+                entry_adx: row.get(14)?,
+                entry_obi: row.get(15)?,
+                market_regime: row.get(16)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -660,9 +777,18 @@ fn load_performance_stats(conn: &Mutex<Connection>) -> Result<PerformanceStats, 
     } else {
         0.0
     };
+    let (strategy_trade_count, strategy_pnl): (i64, f64) = c
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(pnl_usd), 0.0) FROM closed_trades WHERE strategy_version = ?1",
+            params![STRATEGY_VERSION],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0.0));
     Ok(PerformanceStats {
         profit_factor,
         expectancy,
+        strategy_trade_count: strategy_trade_count as usize,
+        strategy_pnl,
     })
 }
 
@@ -846,11 +972,33 @@ fn calculate_fast_indicators(
     if atr <= 0.0 || !atr.is_finite() {
         return None;
     }
+    let directional_period = (closes.len() - 1).min(14);
+    let start = closes.len() - directional_period;
+    let mut positive_dm = 0.0;
+    let mut negative_dm = 0.0;
+    for index in start..closes.len() {
+        let upward = highs[index] - highs[index - 1];
+        let downward = lows[index - 1] - lows[index];
+        if upward > downward && upward > 0.0 {
+            positive_dm += upward;
+        }
+        if downward > upward && downward > 0.0 {
+            negative_dm += downward;
+        }
+    }
+    let positive_di = 100.0 * (positive_dm / directional_period as f64) / atr;
+    let negative_di = 100.0 * (negative_dm / directional_period as f64) / atr;
+    let adx = if positive_di + negative_di > f64::EPSILON {
+        100.0 * (positive_di - negative_di).abs() / (positive_di + negative_di)
+    } else {
+        0.0
+    };
     Some(FastIndicators {
         ema_fast,
         ema_slow,
         rsi,
         atr,
+        adx,
     })
 }
 
@@ -858,9 +1006,10 @@ fn fetch_fast_indicators(
     client: &reqwest::blocking::Client,
     config: &Config,
     symbol: &str,
+    interval: &str,
 ) -> Result<FastIndicators, String> {
     let url = format!(
-        "{}?symbol={symbol}&interval=1m&limit=60",
+        "{}?symbol={symbol}&interval={interval}&limit=60",
         config.futures_url("fapi/v1/klines")
     );
     let rows = client
@@ -890,6 +1039,18 @@ fn fetch_fast_indicators(
         .ok_or_else(|| format!("insufficient indicator data for {symbol}"))
 }
 
+fn classify_market_regime(indicators: &FastIndicators) -> MarketRegime {
+    if indicators.adx < 18.0 {
+        MarketRegime::Sideways
+    } else if indicators.ema_fast > indicators.ema_slow && indicators.rsi >= 52.0 {
+        MarketRegime::Bull
+    } else if indicators.ema_fast < indicators.ema_slow && indicators.rsi <= 48.0 {
+        MarketRegime::Bear
+    } else {
+        MarketRegime::Sideways
+    }
+}
+
 fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Connection>>) {
     let client = match reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(3))
@@ -906,7 +1067,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
     };
     let mut symbol_filters: HashMap<String, SymbolFilters> = HashMap::new();
     let mut obi_samples: HashMap<String, VecDeque<f64>> = HashMap::new();
-    let mut symbol_cooldowns: HashMap<String, Instant> = HashMap::new();
+    let mut symbol_cooldowns = load_symbol_cooldowns(&db_conn);
     let mut consecutive_losses = load_consecutive_losses(&db_conn);
     let current_balance = shared_state
         .lock()
@@ -991,6 +1152,33 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             };
                             pos.pnl_percent = pnl_percent;
                             pos.peak_pnl_percent = pos.peak_pnl_percent.max(pos.pnl_percent);
+
+                            if pos.tp_stage == 0 && pos.peak_pnl_percent >= 0.80 {
+                                if let Some(stop) = break_even_stop(&pos.side, pos.entry_price) {
+                                    if (pos.side == "LONG" && stop > pos.stop_loss)
+                                        || (pos.side == "SHORT" && stop < pos.stop_loss)
+                                    {
+                                        pos.stop_loss = stop;
+                                        pos.status =
+                                            "Erken koruma: ücret üstü break-even".to_string();
+                                    }
+                                }
+                            }
+                            if pos.tp_stage == 0 && pos.peak_pnl_percent >= 1.50 {
+                                if let Some(stop) = protected_profit_stop(
+                                    &pos.side,
+                                    pos.entry_price,
+                                    pos.leverage,
+                                    0.40,
+                                ) {
+                                    if (pos.side == "LONG" && stop > pos.stop_loss)
+                                        || (pos.side == "SHORT" && stop < pos.stop_loss)
+                                    {
+                                        pos.stop_loss = stop;
+                                        pos.status = "Erken koruma: +%0,40 kilitlendi".to_string();
+                                    }
+                                }
+                            }
 
                             let mut remaining_quantity =
                                 pos.quantity.parse::<f64>().unwrap_or_default();
@@ -1107,6 +1295,10 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                         "TP3 Trend Stop".to_string()
                                     } else if pos.tp_stage == 1 {
                                         "TP1 Sonrası Stop".to_string()
+                                    } else if pos.peak_pnl_percent >= 1.50 {
+                                        "Erken Kâr Kilidi".to_string()
+                                    } else if pos.peak_pnl_percent >= 0.80 {
+                                        "Erken Break-Even".to_string()
                                     } else {
                                         "Başlangıç Stop".to_string()
                                     });
@@ -1117,6 +1309,10 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                         "TP3 Trend Stop".to_string()
                                     } else if pos.tp_stage == 1 {
                                         "TP1 Sonrası Stop".to_string()
+                                    } else if pos.peak_pnl_percent >= 1.50 {
+                                        "Erken Kâr Kilidi".to_string()
+                                    } else if pos.peak_pnl_percent >= 0.80 {
+                                        "Erken Break-Even".to_string()
                                     } else {
                                         "Başlangıç Stop".to_string()
                                     });
@@ -1133,9 +1329,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                 } else {
                                     0.0
                                 };
-                                let exit_stage = match pos.tp_stage {
-                                    0 => "SL",
-                                    1 => "TP1",
+                                let exit_stage = match (pos.tp_stage, pos.peak_pnl_percent) {
+                                    (0, peak) if peak >= 1.50 => "LOCK",
+                                    (0, peak) if peak >= 0.80 => "BE",
+                                    (0, _) => "SL",
+                                    (1, _) => "TP1",
                                     _ => "TP3",
                                 };
                                 newly_closed.push(ClosedPosition {
@@ -1149,6 +1347,13 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                     pnl_usd: pos.pnl_usd,
                                     max_pnl_percent: pos.peak_pnl_percent,
                                     exit_stage: exit_stage.to_string(),
+                                    opened_at: pos.opened_at,
+                                    closed_at: unix_timestamp(),
+                                    strategy_version: pos.strategy_version.clone(),
+                                    entry_rsi: pos.entry_rsi,
+                                    entry_adx: pos.entry_adx,
+                                    entry_obi: pos.entry_obi,
+                                    market_regime: pos.market_regime.clone(),
                                 });
                             } else {
                                 still_active.push(pos);
@@ -1189,6 +1394,12 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 if safety_allows_entries {
+                    let market_regime = fetch_fast_indicators(&client, &config, "BTCUSDT", "1h")
+                        .map(|indicators| classify_market_regime(&indicators))
+                        .unwrap_or(MarketRegime::Sideways);
+                    if market_regime == MarketRegime::Sideways {
+                        current_err = "BTC 1s rejimi yatay: yeni girişler bekletiliyor".to_string();
+                    }
                     let mut candidates: Vec<&Ticker> = tickers
                         .iter()
                         .filter(|ticker| is_tradeable_usdt_symbol(&ticker.symbol))
@@ -1197,10 +1408,6 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                                 .quote_volume
                                 .parse::<f64>()
                                 .is_ok_and(|volume| volume >= config.min_quote_volume)
-                                && ticker
-                                    .price_change_percent
-                                    .parse::<f64>()
-                                    .is_ok_and(|change| change.abs() > 2.0)
                         })
                         .collect();
                     candidates.sort_by(|left, right| {
@@ -1209,30 +1416,54 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         right_volume.total_cmp(&left_volume)
                     });
                     candidates.truncate(config.max_signal_candidates);
+                    if market_regime == MarketRegime::Sideways {
+                        candidates.clear();
+                    }
 
                     let market_signals = thread::scope(|scope| {
                         let http_client = &client;
                         let engine_config = &config;
                         let handles: Vec<_> = candidates
                             .into_iter()
-                            .filter(|ticker| {
-                                book_map
-                                    .get(&ticker.symbol)
-                                    .and_then(spread_percent)
-                                    .is_some_and(|spread| spread <= config.max_spread_percent)
+                            .filter_map(|ticker| {
+                                let spread =
+                                    book_map.get(&ticker.symbol).and_then(spread_percent)?;
+                                (spread <= config.max_spread_percent).then_some((ticker, spread))
                             })
-                            .map(|ticker| {
+                            .map(|(ticker, spread)| {
                                 scope.spawn(move || {
                                     let obi =
                                         calculate_obi(http_client, engine_config, &ticker.symbol)
                                             .ok()?;
-                                    let indicators = fetch_fast_indicators(
+                                    let one_minute = fetch_fast_indicators(
                                         http_client,
                                         engine_config,
                                         &ticker.symbol,
+                                        "1m",
                                     )
                                     .ok()?;
-                                    Some((ticker.clone(), obi, indicators))
+                                    let five_minute = fetch_fast_indicators(
+                                        http_client,
+                                        engine_config,
+                                        &ticker.symbol,
+                                        "5m",
+                                    )
+                                    .ok()?;
+                                    let fifteen_minute = fetch_fast_indicators(
+                                        http_client,
+                                        engine_config,
+                                        &ticker.symbol,
+                                        "15m",
+                                    )
+                                    .ok()?;
+                                    Some((
+                                        ticker.clone(),
+                                        obi,
+                                        spread,
+                                        one_minute,
+                                        five_minute,
+                                        fifteen_minute,
+                                    ))
                                 })
                             })
                             .collect();
@@ -1242,15 +1473,14 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             .collect::<Vec<_>>()
                     });
 
-                    for (t, obi, indicators) in market_signals {
-                        let (Ok(change), Ok(vol), Ok(price)) = (
-                            t.price_change_percent.parse::<f64>(),
-                            t.quote_volume.parse::<f64>(),
-                            t.last_price.parse::<f64>(),
-                        ) else {
+                    for (t, obi, spread, one_minute, five_minute, fifteen_minute) in market_signals
+                    {
+                        let (Ok(vol), Ok(price)) =
+                            (t.quote_volume.parse::<f64>(), t.last_price.parse::<f64>())
+                        else {
                             continue;
                         };
-                        if price <= 0.0 || vol < config.min_quote_volume || change.abs() <= 2.0 {
+                        if price <= 0.0 || vol < config.min_quote_volume {
                             continue;
                         }
                         let samples = obi_samples.entry(t.symbol.clone()).or_default();
@@ -1261,16 +1491,26 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         if samples.len() < config.obi_confirmation_samples {
                             continue;
                         }
-                        let normalized_trend =
-                            (indicators.ema_fast - indicators.ema_slow) / indicators.atr;
-                        let long_confirmed = change > 2.0
-                            && samples.iter().all(|value| *value >= 0.20)
+                        let normalized_trend = (fifteen_minute.ema_fast - fifteen_minute.ema_slow)
+                            / fifteen_minute.atr;
+                        let long_confirmed = market_regime == MarketRegime::Bull
+                            && samples.iter().all(|value| *value >= 0.12)
                             && normalized_trend >= 0.05
-                            && (52.0..=75.0).contains(&indicators.rsi);
-                        let short_confirmed = change < -2.0
-                            && samples.iter().all(|value| *value <= -0.20)
+                            && fifteen_minute.adx >= 20.0
+                            && five_minute.ema_fast > five_minute.ema_slow
+                            && five_minute.adx >= 18.0
+                            && (52.0..=72.0).contains(&five_minute.rsi)
+                            && one_minute.ema_fast >= one_minute.ema_slow
+                            && (48.0..=75.0).contains(&one_minute.rsi);
+                        let short_confirmed = market_regime == MarketRegime::Bear
+                            && samples.iter().all(|value| *value <= -0.12)
                             && normalized_trend <= -0.05
-                            && (25.0..=48.0).contains(&indicators.rsi);
+                            && fifteen_minute.adx >= 20.0
+                            && five_minute.ema_fast < five_minute.ema_slow
+                            && five_minute.adx >= 18.0
+                            && (28.0..=48.0).contains(&five_minute.rsi)
+                            && one_minute.ema_fast <= one_minute.ema_slow
+                            && (25.0..=52.0).contains(&one_minute.rsi);
                         let (side, leverage) = if long_confirmed {
                             ("LONG", 3.0)
                         } else if short_confirmed {
@@ -1279,9 +1519,11 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             continue;
                         };
                         let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
-                        let cooling_down = symbol_cooldowns
-                            .get(&t.symbol)
-                            .is_some_and(|closed_at| closed_at.elapsed() < config.cooldown);
+                        let now = unix_timestamp();
+                        let cooling_down =
+                            symbol_cooldowns.get(&t.symbol).is_some_and(|closed_at| {
+                                now.saturating_sub(*closed_at) < config.cooldown.as_secs() as i64
+                            });
                         if already_active
                             || cooling_down
                             || still_active.len() >= config.max_positions
@@ -1305,7 +1547,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             continue;
                         }
                         let stop_distance =
-                            (indicators.atr * 1.8).clamp(price * 0.006, price * 0.03);
+                            (fifteen_minute.atr * 1.8).clamp(price * 0.006, price * 0.03);
                         let (stop_loss, tp1_price, tp2_price, take_profit) = if side == "LONG" {
                             (
                                 price - stop_distance,
@@ -1369,7 +1611,16 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                             tp2_price,
                             tp_stage: 0,
                             realized_pnl_usd: 0.0,
-                            atr: indicators.atr,
+                            atr: fifteen_minute.atr,
+                            opened_at: now,
+                            strategy_version: STRATEGY_VERSION.to_string(),
+                            entry_ema_fast: fifteen_minute.ema_fast,
+                            entry_ema_slow: fifteen_minute.ema_slow,
+                            entry_rsi: five_minute.rsi,
+                            entry_adx: fifteen_minute.adx,
+                            entry_obi: obi,
+                            entry_spread: spread,
+                            market_regime: market_regime.as_str().to_string(),
                         });
                     }
                 }
@@ -1393,7 +1644,7 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 for closed in &newly_closed {
-                    symbol_cooldowns.insert(closed.symbol.clone(), Instant::now());
+                    symbol_cooldowns.insert(closed.symbol.clone(), closed.closed_at);
                     if closed.pnl_usd < 0.0 {
                         consecutive_losses += 1;
                     } else {
@@ -1476,6 +1727,7 @@ fn render_dashboard(state: &AppState) -> String {
     let used_margin_text = format_money(used_margin, false);
     let win_rate_text = format_percent(win_rate, 1, false);
     let profit_factor_text = format_tr_number(state.stats.profit_factor, 2, false);
+    let strategy_pnl_text = format_money(state.stats.strategy_pnl, true);
 
     let mut html = format!(
         r#"<!doctype html>
@@ -1516,7 +1768,7 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
 <div class="stat"><span>Kullanılan Marjin</span><strong>{used_margin} USDT</strong></div>
 <div class="stat"><span>Başarı Oranı</span><strong>{win_rate}</strong></div>
 <div class="stat"><span>Kâr Faktörü</span><strong>{pf}</strong></div></section>
-<div class="section-head"><h2>Açık Pozisyonlar</h2><span>{position_count} pozisyon</span></div><section class="position-grid">"#,
+<div class="section-head"><h2>Açık Pozisyonlar</h2><span>{strategy} · {strategy_count}/100 işlem · PnL {strategy_pnl} USDT · {position_count} pozisyon</span></div><section class="position-grid">"#,
         status_class = status_class,
         status = escape_html(status_text),
         balance = balance_text,
@@ -1531,6 +1783,9 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
         used_margin = used_margin_text,
         win_rate = win_rate_text,
         pf = profit_factor_text,
+        strategy = STRATEGY_VERSION,
+        strategy_count = state.stats.strategy_trade_count,
+        strategy_pnl = strategy_pnl_text,
         position_count = state.positions.len()
     );
 
@@ -1556,11 +1811,12 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
             };
             html.push_str(&format!(
                 r#"<article class="position {side_class}"><div class="position-top">
-<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage}x kaldıraç · {notional} USDT · TP aşaması {tp_stage}/3</div></div>
+<div><div class="symbol">{symbol}</div><div class="position-meta">#{id} · {leverage}x kaldıraç · {notional} USDT · TP aşaması {tp_stage}/3 · {strategy} · {regime}</div></div>
 <div style="display:flex;gap:12px;align-items:start"><span class="side">{side}</span><div class="pnl"><strong class="{pnl_class}">{pnl_usd} USDT</strong><small>{pnl_percent}</small></div></div></div>
 <div class="price-grid"><div><span>Giriş</span><b>{entry}</b></div><div><span>Anlık</span><b>{current}</b></div><div><span>Miktar</span><b>{quantity}</b></div></div>
 <div class="risk-row"><span>Marjin <b>{margin} USDT</b></span><span>Stop <b>{stop}</b></span><span>TP1 <b>{tp1}</b></span><span>TP2 <b>{tp2}</b></span><span>Trend hedefi <b>{take_profit}</b></span></div></article>"#,
                 side_class=side_class,symbol=escape_html(&position.symbol),id=position.id,leverage=leverage_text,notional=notional_text,pnl_class=pnl_class,tp_stage=position.tp_stage,
+                strategy=escape_html(&position.strategy_version),regime=escape_html(&position.market_regime),
                 side=escape_html(&position.side),pnl_usd=pnl_usd_text,pnl_percent=pnl_percent_text,entry=format_price(position.entry_price),
                 current=format_price(position.current_price),quantity=format_quantity(&position.quantity),margin=margin_text,
                 stop=format_price(position.stop_loss),tp1=format_price(position.tp1_price),tp2=format_price(position.tp2_price),take_profit=format_price(position.take_profit)
@@ -1570,11 +1826,11 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
 
     html.push_str(&format!(
         r#"</section><div class="section-head"><h2>İşlem Geçmişi</h2><span>{closed} kapanan · İşlem başı {expectancy} USDT</span></div>
-<div class="table-wrap"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>Kapanış</th><th>Maks. PnL</th><th>PnL</th><th>PnL &#36;</th></tr></thead><tbody>"#,
+<div class="table-wrap"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Strateji</th><th>Giriş</th><th>Çıkış</th><th>Kapanış</th><th>Maks. PnL</th><th>PnL</th><th>PnL &#36;</th></tr></thead><tbody>"#,
         closed=state.accounting.closed_trades_count,expectancy=format_money(state.stats.expectancy, true)
     ));
     if state.history.is_empty() {
-        html.push_str(r#"<tr><td colspan="9" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
+        html.push_str(r#"<tr><td colspan="10" style="text-align:center;color:var(--muted)">Henüz kapanan işlem yok.</td></tr>"#);
     } else {
         for trade in &state.history {
             let side_class = if trade.side == "LONG" {
@@ -1588,8 +1844,9 @@ body:after{{content:"";position:fixed;inset:0;z-index:-1;opacity:.22;background-
                 "negative"
             };
             html.push_str(&format!(
-                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{entry}</td><td>{exit}</td><td>{exit_stage}: {status}</td><td>{max_pnl}</td><td class="{pnl_class}">{pnl_percent}</td><td class="{pnl_class}">{pnl_usd} USDT</td></tr>"#,
+                r#"<tr><td>#{id}</td><td><b>{symbol}</b></td><td class="side-text {side_class}">{side}</td><td>{strategy}<br><small>{regime}</small></td><td>{entry}</td><td>{exit}</td><td>{exit_stage}: {status}</td><td>{max_pnl}</td><td class="{pnl_class}">{pnl_percent}</td><td class="{pnl_class}">{pnl_usd} USDT</td></tr>"#,
                 id=trade.id,symbol=escape_html(&trade.symbol),side_class=side_class,side=escape_html(&trade.side),
+                strategy=escape_html(&trade.strategy_version),regime=escape_html(&trade.market_regime),
                 entry=format_price(trade.entry_price),exit=format_price(trade.exit_price),status=escape_html(&trade.status),
                 exit_stage=escape_html(&trade.exit_stage),max_pnl=format_percent(trade.max_pnl_percent, 2, true),
                 pnl_class=pnl_class,pnl_percent=format_percent(trade.pnl_percent, 2, true),pnl_usd=format_money(trade.pnl_usd, true)
@@ -1604,7 +1861,7 @@ fn main() {
     dotenv().ok();
     let config = Config {
         base_url: env::var("BINANCE_BASE_URL")
-            .unwrap_or_else(|_| "https://testnet.binancefuture.com".into()),
+            .unwrap_or_else(|_| "https://fapi.binance.com".into()),
         entry_enabled: env::var("ENTRY_ENABLED")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
@@ -1621,7 +1878,7 @@ fn main() {
         max_signal_candidates: env::var("MAX_SIGNAL_CANDIDATES")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(20)
+            .unwrap_or(12)
             .clamp(5, 50),
         max_trade_allocation: env::var("MAX_TRADE_ALLOCATION")
             .ok()
@@ -1763,6 +2020,15 @@ mod tests {
     }
 
     #[test]
+    fn protected_profit_stop_locks_both_directions() {
+        let long_stop = protected_profit_stop("LONG", 100.0, 3.0, 0.40).unwrap();
+        let short_stop = protected_profit_stop("SHORT", 100.0, 3.0, 0.40).unwrap();
+        assert!(long_stop > break_even_stop("LONG", 100.0).unwrap());
+        assert!(short_stop < break_even_stop("SHORT", 100.0).unwrap());
+        assert_eq!(protected_profit_stop("INVALID", 100.0, 3.0, 0.40), None);
+    }
+
+    #[test]
     fn quantity_respects_exchange_filters() {
         let filters = SymbolFilters {
             min_qty: 0.001,
@@ -1846,6 +2112,20 @@ mod tests {
         assert!(indicators.ema_fast > indicators.ema_slow);
         assert!(indicators.rsi > 50.0);
         assert!(indicators.atr > 0.0);
+        assert!(indicators.adx > 0.0);
+        assert_eq!(classify_market_regime(&indicators), MarketRegime::Bull);
+    }
+
+    #[test]
+    fn weak_adx_is_sideways_regime() {
+        let indicators = FastIndicators {
+            ema_fast: 101.0,
+            ema_slow: 100.0,
+            rsi: 60.0,
+            atr: 1.0,
+            adx: 10.0,
+        };
+        assert_eq!(classify_market_regime(&indicators), MarketRegime::Sideways);
     }
 
     #[test]

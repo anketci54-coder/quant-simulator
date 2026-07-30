@@ -39,13 +39,18 @@ Panel varsayılan olarak yalnızca `127.0.0.1:8080` üzerinde dinler.
 - Sembol başına bir saat cooldown
 - 3x kaldıraç
 - En az 20M USDT hacim, en fazla %0,10 spread ve üç ardışık OBI teyidi
-- Yalnızca standart ASCII `*USDT` sembolleri; tarama başına en likit 20 aday
+- Yalnızca standart ASCII `*USDT` sembolleri; tarama başına en likit 12 aday
 - Futures `exchangeInfo` üzerinden sembol bazlı `LOT_SIZE`
 - Başlangıçta bakiye `closed_trades` ledger toplamından otomatik uzlaştırılır
-- Peak PnL tabanlı break-even ve trailing stop
-- EMA 8/21, RSI 7, ATR 14 ve OBI birleşik hızlı trend sinyali
+- Üretim Futures public market verisi (`fapi.binance.com`); API anahtarı kullanılmaz
+- `MTF_V3`: BTC 1 saatlik piyasa rejimi ile yön filtresi
+- 15 dakikalık EMA/ADX ana trendi, 5 dakikalık teyit ve 1 dakikalık giriş zamanlaması
+- OBI yalnızca kısa vadeli giriş zamanlaması için kullanılır
+- Peak PnL %0,80'de ücret üstü break-even, %1,50'de en az %0,40 kâr kilidi
 - TP1'de %30, TP2'de %30 kısmi realizasyon; kalan %40 ATR tabanlı trend stopuyla yönetilir
-- Kapanış aşaması ve görülen maksimum PnL işlem geçmişinde saklanır
+- Kapanış aşaması (`SL/BE/LOCK/TP1/TP3`), strateji sürümü, rejim ve giriş sinyal görüntüsü saklanır
+- Cooldown yeniden başlatmalar arasında SQLite üzerinde korunur
+- Panelde `MTF_V3` örnek sayısı ve strateji PnL'ı eski işlemlerden ayrı gösterilir
 - SQLite WAL ve atomik batch snapshot
 - Varsayılan başlangıç bakiyesi: 10.000 USDT (`INITIAL_BALANCE_USDT`)
 - Panel fiyatları büyüklüğe göre 2/4/6/8 ondalık, PnL ve bakiye 2 ondalık gösterilir
