@@ -14,7 +14,7 @@ use crate::{
 
 pub type SymbolStore = Arc<DashMap<String, SymbolState>>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Universe {
     symbols: Arc<DashMap<String, SymbolMeta>>,
 }
@@ -39,6 +39,10 @@ impl Universe {
 
     pub fn len(&self) -> usize {
         self.symbols.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
     }
 
     pub fn symbols(&self) -> HashSet<String> {
