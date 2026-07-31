@@ -117,10 +117,14 @@ async fn main() -> Result<()> {
     position_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut dashboard_interval = time::interval(Duration::from_secs(1));
     dashboard_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut maintenance_interval = time::interval(Duration::from_secs(3_600));
+    maintenance_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    maintenance_interval.tick().await;
     let mut last_entry_attempt: HashMap<String, i64> = HashMap::new();
     let mut symbol_cooldown_until: HashMap<String, i64> = HashMap::new();
     let mut recent_entries: VecDeque<i64> = VecDeque::new();
     let mut funding_schedule: HashMap<String, (i64, f64)> = HashMap::new();
+    let mut last_hot_log = 0i64;
     let shutdown_signal = shutdown_signal();
     tokio::pin!(shutdown_signal);
 
@@ -204,6 +208,12 @@ async fn main() -> Result<()> {
                     now_millis(),
                 ));
             }
+            _ = maintenance_interval.tick() => {
+                let now = now_millis();
+                let rejected_before = now.saturating_sub(7 * 24 * 60 * 60 * 1_000);
+                let deleted = database.maintain(rejected_before)?;
+                println!("database_maintenance deleted_rejections={deleted}");
+            }
             command = emergency_rx.recv() => {
                 let Some(command) = command else {
                     continue;
@@ -250,14 +260,17 @@ async fn main() -> Result<()> {
                 portfolio
                     .record_gate_rejections(&frame.gate_rejections, now)
                     .context("Sinyal ret geçişleri kaydedilemedi")?;
-                if let Some(best) = frame.candidates.first() {
-                    println!(
-                        "hot_set={} best={} score={:.1} tracked={}",
-                        frame.candidates.len(),
-                        best.symbol,
-                        best.score,
-                        store.len()
-                    );
+                if now.saturating_sub(last_hot_log) >= 60_000 {
+                    last_hot_log = now;
+                    if let Some(best) = frame.candidates.first() {
+                        println!(
+                            "hot_set={} best={} score={:.1} tracked={}",
+                            frame.candidates.len(),
+                            best.symbol,
+                            best.score,
+                            store.len()
+                        );
+                    }
                 }
                 if config.entry_enabled && !portfolio.snapshot().entries_paused {
                     while recent_entries.front().is_some_and(|entry| now.saturating_sub(*entry) >= 60_000) {
