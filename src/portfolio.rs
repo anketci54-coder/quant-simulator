@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::{
     cost::CostModel,
+    engine::GateRejection,
     market::SymbolMeta,
     model::{Candidate, Side, STRATEGY_VERSION},
     position::{ExitReason, Position, PositionEvent, PositionPolicy, PositionQuote, PositionStage},
@@ -247,6 +248,34 @@ impl PortfolioEngine {
             }
         };
         Ok(result)
+    }
+
+    pub fn record_gate_rejections(&self, rejections: &[GateRejection], now: i64) -> Result<()> {
+        if rejections.is_empty() {
+            return Ok(());
+        }
+        let decisions: Vec<SignalDecision> = rejections
+            .iter()
+            .map(|rejection| SignalDecision {
+                decision_key: format!(
+                    "GATE:{}:{}:{}",
+                    rejection.symbol,
+                    rejection.observed_at,
+                    rejection.reason.as_str()
+                ),
+                symbol: rejection.symbol.clone(),
+                side: None,
+                score: rejection.features.cheap_score,
+                confidence: (rejection.features.cheap_score / 100.0).clamp(0.0, 1.0),
+                accepted: false,
+                reject_reason: Some(rejection.reason.as_str().to_string()),
+                features: rejection.features,
+                observed_at: rejection.observed_at,
+            })
+            .collect();
+        self.store
+            .persist_atomic(&self.snapshot, &[], &decisions, now)
+            .context("Sinyal kapısı retleri atomik kaydedilemedi")
     }
 
     fn evaluate_open(

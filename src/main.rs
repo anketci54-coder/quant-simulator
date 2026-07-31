@@ -10,7 +10,7 @@ use dotenvy::dotenv;
 use quant_bot::{
     config::Config,
     cost::CostModel,
-    engine::{run_feature_engine, HotSet},
+    engine::{run_feature_engine, EngineFrame, HotSet},
     market::{run_market_stream, run_universe_manager, SymbolStore, Universe},
     model::Side,
     panel::{run_panel, DashboardSnapshot, EmergencyCommand, PositionView},
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     let store: SymbolStore = Arc::new(DashMap::new());
     let (universe_ready_tx, mut universe_ready_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (hot_tx, mut hot_rx) = watch::channel(Vec::new());
+    let (hot_tx, mut hot_rx) = watch::channel(EngineFrame::default());
     let hot_set: HotSet = Arc::new(hot_tx);
     let (dashboard_tx, dashboard_rx) = watch::channel(DashboardSnapshot::default());
     let (emergency_tx, mut emergency_rx) = mpsc::channel::<EmergencyCommand>(4);
@@ -225,19 +225,22 @@ async fn main() -> Result<()> {
                 if changed.is_err() {
                     break;
                 }
-                let hot = hot_rx.borrow().clone();
-                if let Some(best) = hot.first() {
+                let frame = hot_rx.borrow().clone();
+                let now = now_millis();
+                portfolio
+                    .record_gate_rejections(&frame.gate_rejections, now)
+                    .context("Sinyal ret geçişleri kaydedilemedi")?;
+                if let Some(best) = frame.candidates.first() {
                     println!(
                         "hot_set={} best={} score={:.1} tracked={}",
-                        hot.len(),
+                        frame.candidates.len(),
                         best.symbol,
                         best.score,
                         store.len()
                     );
                 }
                 if config.entry_enabled && !portfolio.snapshot().entries_paused {
-                    let now = now_millis();
-                    for candidate in &hot {
+                    for candidate in &frame.candidates {
                         if portfolio.snapshot().positions.len() >= config.max_positions {
                             break;
                         }

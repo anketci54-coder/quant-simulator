@@ -12,7 +12,21 @@ use crate::{
     model::{Candidate, FeatureSnapshot, Side, SymbolState},
 };
 
-pub type HotSet = Arc<watch::Sender<Vec<Candidate>>>;
+#[derive(Clone, Debug, Default)]
+pub struct EngineFrame {
+    pub candidates: Vec<Candidate>,
+    pub gate_rejections: Vec<GateRejection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GateRejection {
+    pub symbol: String,
+    pub reason: CandidateReject,
+    pub features: FeatureSnapshot,
+    pub observed_at: i64,
+}
+
+pub type HotSet = Arc<watch::Sender<EngineFrame>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateReject {
@@ -47,6 +61,7 @@ pub async fn run_feature_engine(
 ) {
     let mut interval = time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut last_rejections: HashMap<String, CandidateReject> = HashMap::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -57,16 +72,34 @@ pub async fn run_feature_engine(
             _ = interval.tick() => {
                 let now = now_millis();
                 let mut candidates = Vec::new();
+                let mut gate_rejections = Vec::new();
                 for mut entry in store.iter_mut() {
                     let features = calculate_features(&entry, now);
                     entry.features = features;
-                    if let Ok(candidate) = candidate_from(&config, &entry, now) {
-                        candidates.push(candidate);
+                    match candidate_from(&config, &entry, now) {
+                        Ok(candidate) => {
+                            last_rejections.remove(&candidate.symbol);
+                            candidates.push(candidate);
+                        }
+                        Err(reason) => {
+                            let symbol = entry.symbol.clone();
+                            if last_rejections.insert(symbol.clone(), reason) != Some(reason) {
+                                gate_rejections.push(GateRejection {
+                                    symbol,
+                                    reason,
+                                    features,
+                                    observed_at: now,
+                                });
+                            }
+                        }
                     }
                 }
                 candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
                 candidates.truncate(config.hot_set_size);
-                hot_set.send_replace(candidates);
+                hot_set.send_replace(EngineFrame {
+                    candidates,
+                    gate_rejections,
+                });
             }
         }
     }
@@ -78,7 +111,7 @@ fn calculate_features(state: &SymbolState, now: i64) -> FeatureSnapshot {
     let return_300s = return_since(state, now - 300_000);
     let volume_impulse = volume_impulse(state, now - 60_000);
     let volatility = realized_volatility(state, now - 60_000);
-    let spread_percent = state.spread_percent().unwrap_or(f64::INFINITY);
+    let spread_percent = state.spread_percent().unwrap_or(100.0);
     let book_imbalance = state.top_book_imbalance().unwrap_or_default();
     let momentum = normalized(return_15s.abs(), 0.05, 0.80);
     let volume = normalized(volume_impulse, 0.0, 0.002);
