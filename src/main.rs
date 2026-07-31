@@ -54,9 +54,8 @@ async fn main() -> Result<()> {
     ));
     universe_ready_rx.wait_for(|ready| *ready).await?;
 
-    let database = Arc::new(
-        SqliteStore::open(&config.database_path).context("MTF_V4 SQLite başlatılamadı")?,
-    );
+    let database =
+        Arc::new(SqliteStore::open(&config.database_path).context("MTF_V4 SQLite başlatılamadı")?);
     let portfolio_snapshot = database
         .load_or_create(config.initial_balance, now_millis())
         .context("MTF_V4 AppState geri yüklenemedi")?;
