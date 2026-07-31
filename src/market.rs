@@ -48,6 +48,7 @@ pub struct SymbolMeta {
     pub tick_size: f64,
     pub step_size: f64,
     pub min_quantity: f64,
+    pub min_notional: f64,
 }
 
 impl Universe {
@@ -106,6 +107,7 @@ impl Universe {
                 tick_size: 0.0,
                 step_size: 0.0,
                 min_quantity: 0.0,
+                min_notional: 0.0,
             };
             for filter in symbol.filters {
                 match filter.filter_type.as_str() {
@@ -114,10 +116,15 @@ impl Universe {
                         meta.step_size = parse_or_zero(&filter.step_size);
                         meta.min_quantity = parse_or_zero(&filter.min_qty);
                     }
+                    "MIN_NOTIONAL" | "NOTIONAL" => {
+                        meta.min_notional = parse_or_zero(&filter.notional)
+                            .max(parse_or_zero(&filter.min_notional));
+                    }
                     _ => {}
                 }
             }
-            if meta.tick_size > 0.0 && meta.step_size > 0.0 && meta.min_quantity > 0.0 {
+            if meta.tick_size > 0.0 && meta.step_size > 0.0 && meta.min_quantity > 0.0
+                && meta.min_notional > 0.0 {
                 next.push((symbol.symbol, meta));
             }
         }
@@ -386,6 +393,10 @@ struct ExchangeFilter {
     step_size: String,
     #[serde(rename = "minQty", default)]
     min_qty: String,
+    #[serde(default)]
+    notional: String,
+    #[serde(rename = "minNotional", default)]
+    min_notional: String,
 }
 
 #[cfg(test)]
@@ -409,6 +420,7 @@ mod tests {
                 tick_size: 0.1,
                 step_size: 0.001,
                 min_quantity: 0.001,
+                min_notional: 5.0,
             },
         );
         let store: SymbolStore = Arc::new(DashMap::new());
@@ -445,6 +457,7 @@ mod tests {
                 tick_size: 0.1,
                 step_size: 0.001,
                 min_quantity: 0.001,
+                min_notional: 5.0,
             },
         );
         let store: SymbolStore = Arc::new(DashMap::new());
