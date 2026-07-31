@@ -132,7 +132,7 @@ fn calculate_features(state: &SymbolState, now: i64) -> FeatureSnapshot {
         spread_percent,
         book_imbalance,
         cheap_score,
-        updated_at: state.event_time,
+        updated_at: state.price_received_at,
     }
 }
 
@@ -142,8 +142,13 @@ fn candidate_from(
     now: i64,
 ) -> Result<Candidate, CandidateReject> {
     let features = state.features;
-    if now.saturating_sub(state.event_time) > config.stale_after.as_millis() as i64
+    if now.saturating_sub(state.price_received_at)
+        > config.price_stale_after.as_millis() as i64
+        || now.saturating_sub(state.book_received_at)
+            > config.book_stale_after.as_millis() as i64
         || state.last_price <= 0.0
+        || state.bid <= 0.0
+        || state.ask <= state.bid
     {
         return Err(CandidateReject::Stale);
     }
@@ -312,7 +317,8 @@ mod tests {
     fn config() -> Config {
         Config {
             rest_base_url: "https://example.test".to_string(),
-            websocket_url: "wss://example.test".to_string(),
+            market_websocket_url: "wss://example.test/market".to_string(),
+            book_websocket_url: "wss://example.test/book".to_string(),
             database_path: "test.db".to_string(),
             panel_bind: "127.0.0.1:8080".parse().unwrap(),
             panel_action_token: "0123456789abcdef0123456789abcdef".to_string(),
@@ -330,7 +336,8 @@ mod tests {
             min_quote_volume: 20_000_000.0,
             max_spread_percent: 0.10,
             hot_set_size: 64,
-            stale_after: Duration::from_secs(5),
+            price_stale_after: Duration::from_secs(5),
+            book_stale_after: Duration::from_secs(15),
         }
     }
 
@@ -357,7 +364,8 @@ mod tests {
             bid_quantity: 1_000.0,
             ask_quantity: 2_000.0,
             quote_volume: 30_000_000.0,
-            event_time: now,
+            price_received_at: now,
+            book_received_at: now,
             features: FeatureSnapshot {
                 return_15s: -0.20,
                 return_60s: -0.40,
