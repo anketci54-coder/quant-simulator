@@ -279,12 +279,11 @@ impl PortfolioEngine {
             .iter()
             .filter(|rejection| {
                 let reason = rejection.reason.as_str();
-                let should_record = self
-                    .gate_rejection_cache
-                    .get(&rejection.symbol)
-                    .is_none_or(|(previous_reason, previous_at)| {
+                let should_record = self.gate_rejection_cache.get(&rejection.symbol).is_none_or(
+                    |(previous_reason, previous_at)| {
                         previous_reason != reason || now.saturating_sub(*previous_at) >= 900_000
-                    });
+                    },
+                );
                 if should_record {
                     self.gate_rejection_cache
                         .insert(rejection.symbol.clone(), (reason.to_string(), now));
