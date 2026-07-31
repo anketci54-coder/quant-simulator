@@ -198,7 +198,7 @@ impl PortfolioEngine {
         };
 
         let result = match outcome {
-            Ok((size, entry_fill)) => {
+            Ok((size, entry_fill, expected_net_profit)) => {
                 let risk_distance = candidate.stop_distance;
                 let initial_stop = entry_fill - candidate.side.direction() * risk_distance;
                 let tp1 = entry_fill + candidate.side.direction() * risk_distance;
@@ -247,6 +247,7 @@ impl PortfolioEngine {
                         "stop": initial_stop,
                         "tp1": tp1,
                         "tp2": tp2,
+                        "expected_net_profit": expected_net_profit,
                         "policy": "40/40/20_RUNNER"
                     })
                     .to_string(),
@@ -320,7 +321,7 @@ impl PortfolioEngine {
         candidate: &Candidate,
         meta: &SymbolMeta,
         quote: Quote,
-    ) -> std::result::Result<(PositionSize, f64), EntryReject> {
+    ) -> std::result::Result<(PositionSize, f64, f64), EntryReject> {
         if self.snapshot.entries_paused {
             return Err(EntryReject::EntriesPaused);
         }
@@ -373,9 +374,18 @@ impl PortfolioEngine {
         if notional < meta.min_notional.max(self.limits.min_trade_notional) {
             return Err(EntryReject::NotionalTooSmall);
         }
-        let conservative_tp1_net =
-            size.quantity * candidate.stop_distance * 0.40 - notional * expected_cost_rate;
-        if conservative_tp1_net < self.limits.min_expected_net_profit {
+        // Planned lifecycle realizes 40% at 1R, 40% at 2R and leaves 20%
+        // for a runner. Value the runner conservatively at 3R, then discount
+        // the gross reward by signal confidence and subtract full round-trip
+        // fees/slippage. This matches the actual 40/40/20 policy instead of
+        // incorrectly judging the whole trade only by its TP1 slice.
+        let lifecycle_reward_r = 0.40 * 1.0 + 0.40 * 2.0 + 0.20 * 3.0;
+        let expected_net_profit = size.quantity
+            * candidate.stop_distance
+            * lifecycle_reward_r
+            * candidate.confidence
+            - notional * expected_cost_rate;
+        if expected_net_profit < self.limits.min_expected_net_profit {
             return Err(EntryReject::ExpectedProfitTooSmall);
         }
         if actual_margin > self.free_margin() {
@@ -395,7 +405,7 @@ impl PortfolioEngine {
         {
             return Err(EntryReject::PortfolioRisk);
         }
-        Ok((size, entry_fill))
+        Ok((size, entry_fill, expected_net_profit))
     }
 
     pub fn process_quote(
