@@ -500,6 +500,87 @@ impl PortfolioEngine {
     }
 }
 
+fn ledger_from_event(
+    position_id: u64,
+    symbol: &str,
+    side: Side,
+    event: &PositionEvent,
+    now: i64,
+    sequence: usize,
+) -> LedgerEvent {
+    match event {
+        PositionEvent::StopMoved { old, new, stage } => LedgerEvent {
+            event_key: format!("{position_id}:{now}:{sequence}:STOP"),
+            position_id,
+            symbol: symbol.to_string(),
+            side,
+            stage: *stage,
+            event_type: "STOP_MOVED".to_string(),
+            quantity: 0.0,
+            price: *new,
+            net_pnl: 0.0,
+            fee: 0.0,
+            funding: 0.0,
+            exit_reason: None,
+            payload_json: json!({"old_stop": old, "new_stop": new}).to_string(),
+            created_at: now,
+        },
+        PositionEvent::PartialExit {
+            quantity,
+            exit_fill,
+            entry_fee_allocated,
+            exit_fee,
+            funding,
+            net_pnl,
+            stage,
+            fraction_of_original,
+        } => LedgerEvent {
+            event_key: format!("{position_id}:{now}:{sequence}:PARTIAL"),
+            position_id,
+            symbol: symbol.to_string(),
+            side,
+            stage: *stage,
+            event_type: "PARTIAL_EXIT".to_string(),
+            quantity: *quantity,
+            price: *exit_fill,
+            net_pnl: *net_pnl,
+            fee: *exit_fee,
+            funding: *funding,
+            exit_reason: None,
+            payload_json: json!({
+                "fraction_of_original": fraction_of_original,
+                "entry_fee_allocated": entry_fee_allocated
+            })
+            .to_string(),
+            created_at: now,
+        },
+        PositionEvent::Closed {
+            quantity,
+            exit_fill,
+            entry_fee_allocated,
+            exit_fee,
+            funding,
+            net_pnl,
+            reason,
+        } => LedgerEvent {
+            event_key: format!("{position_id}:{now}:{sequence}:CLOSE"),
+            position_id,
+            symbol: symbol.to_string(),
+            side,
+            stage: PositionStage::Closed,
+            event_type: "CLOSE".to_string(),
+            quantity: *quantity,
+            price: *exit_fill,
+            net_pnl: *net_pnl,
+            fee: *exit_fee,
+            funding: *funding,
+            exit_reason: Some(*reason),
+            payload_json: json!({"entry_fee_allocated": entry_fee_allocated}).to_string(),
+            created_at: now,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -627,86 +708,5 @@ mod tests {
         assert_eq!(restored.pause_reason.as_deref(), Some("EMERGENCY_EXIT"));
         drop(store);
         cleanup(&path);
-    }
-}
-
-fn ledger_from_event(
-    position_id: u64,
-    symbol: &str,
-    side: Side,
-    event: &PositionEvent,
-    now: i64,
-    sequence: usize,
-) -> LedgerEvent {
-    match event {
-        PositionEvent::StopMoved { old, new, stage } => LedgerEvent {
-            event_key: format!("{position_id}:{now}:{sequence}:STOP"),
-            position_id,
-            symbol: symbol.to_string(),
-            side,
-            stage: *stage,
-            event_type: "STOP_MOVED".to_string(),
-            quantity: 0.0,
-            price: *new,
-            net_pnl: 0.0,
-            fee: 0.0,
-            funding: 0.0,
-            exit_reason: None,
-            payload_json: json!({"old_stop": old, "new_stop": new}).to_string(),
-            created_at: now,
-        },
-        PositionEvent::PartialExit {
-            quantity,
-            exit_fill,
-            entry_fee_allocated,
-            exit_fee,
-            funding,
-            net_pnl,
-            stage,
-            fraction_of_original,
-        } => LedgerEvent {
-            event_key: format!("{position_id}:{now}:{sequence}:PARTIAL"),
-            position_id,
-            symbol: symbol.to_string(),
-            side,
-            stage: *stage,
-            event_type: "PARTIAL_EXIT".to_string(),
-            quantity: *quantity,
-            price: *exit_fill,
-            net_pnl: *net_pnl,
-            fee: *exit_fee,
-            funding: *funding,
-            exit_reason: None,
-            payload_json: json!({
-                "fraction_of_original": fraction_of_original,
-                "entry_fee_allocated": entry_fee_allocated
-            })
-            .to_string(),
-            created_at: now,
-        },
-        PositionEvent::Closed {
-            quantity,
-            exit_fill,
-            entry_fee_allocated,
-            exit_fee,
-            funding,
-            net_pnl,
-            reason,
-        } => LedgerEvent {
-            event_key: format!("{position_id}:{now}:{sequence}:CLOSE"),
-            position_id,
-            symbol: symbol.to_string(),
-            side,
-            stage: PositionStage::Closed,
-            event_type: "CLOSE".to_string(),
-            quantity: *quantity,
-            price: *exit_fill,
-            net_pnl: *net_pnl,
-            fee: *exit_fee,
-            funding: *funding,
-            exit_reason: Some(*reason),
-            payload_json: json!({"entry_fee_allocated": entry_fee_allocated}).to_string(),
-            created_at: now,
-        },
     }
 }
