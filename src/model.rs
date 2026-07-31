@@ -17,7 +17,9 @@ pub struct SymbolState {
     pub mark_price: f64,
     pub funding_rate: f64,
     pub next_funding_time: i64,
-    pub event_time: i64,
+    pub price_received_at: i64,
+    pub book_received_at: i64,
+    pub mark_received_at: i64,
     pub samples: VecDeque<MarketSample>,
     pub features: FeatureSnapshot,
 }
@@ -130,6 +132,8 @@ pub struct MiniTicker {
     pub close: f64,
     #[serde(rename = "q", deserialize_with = "de_f64")]
     pub quote_volume: f64,
+    #[serde(rename = "st", default)]
+    pub symbol_type: Option<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -146,6 +150,8 @@ pub struct BookTicker {
     pub ask: f64,
     #[serde(rename = "A", deserialize_with = "de_f64")]
     pub ask_quantity: f64,
+    #[serde(rename = "st", default)]
+    pub symbol_type: Option<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -160,6 +166,8 @@ pub struct MarkPrice {
     pub funding_rate: f64,
     #[serde(rename = "T")]
     pub next_funding_time: i64,
+    #[serde(rename = "st", default)]
+    pub symbol_type: Option<u8>,
 }
 
 fn de_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
