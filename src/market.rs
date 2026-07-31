@@ -122,7 +122,7 @@ impl Universe {
             }
         }
         if next.is_empty() {
-            anyhow::bail!("exchangeInfo kullanÄ±labilir USD-M perpetual sembol dÃ¶ndÃ¼rmedi");
+            anyhow::bail!("exchangeInfo kullanılabilir USD-M perpetual sembol döndürmedi");
         }
         let next_symbols: HashSet<String> = next.iter().map(|(symbol, _)| symbol.clone()).collect();
         for (symbol, meta) in next {
@@ -272,7 +272,8 @@ fn apply_message_at(
     if stream_name.contains("miniticker") {
         let tickers: Vec<MiniTicker> = serde_json::from_value(event.data)?;
         for ticker in tickers {
-            if !universe.contains(&ticker.symbol) || ticker.symbol_type.is_some_and(|kind| kind != 1)
+            if !universe.contains(&ticker.symbol)
+                || ticker.symbol_type.is_some_and(|kind| kind != 1)
             {
                 continue;
             }
@@ -299,8 +300,7 @@ fn apply_message_at(
             vec![serde_json::from_value(event.data)?]
         };
         for ticker in tickers {
-            if universe.contains(&ticker.symbol)
-                && ticker.symbol_type.is_none_or(|kind| kind == 1)
+            if universe.contains(&ticker.symbol) && ticker.symbol_type.is_none_or(|kind| kind == 1)
             {
                 let mut state = store
                     .entry(ticker.symbol.clone())
@@ -397,7 +397,7 @@ mod tests {
         assert!(is_safe_symbol("BTCUSDT"));
         assert!(is_safe_symbol("1000PEPEUSDT"));
         assert!(!is_safe_symbol("BTC-USDT"));
-        assert!(!is_safe_symbol("æˆ‘æ¥äº†USDT"));
+        assert!(!is_safe_symbol("我来了USDT"));
     }
 
     #[test]
