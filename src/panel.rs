@@ -191,9 +191,11 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <script>
 const ACTION_TOKEN=__ACTION_TOKEN__;
 const money=new Intl.NumberFormat('tr-TR',{minimumFractionDigits:2,maximumFractionDigits:2});
+const count=new Intl.NumberFormat('tr-TR',{maximumFractionDigits:0});
 const qty=new Intl.NumberFormat('tr-TR',{maximumFractionDigits:6});
 const price=v=>new Intl.NumberFormat('tr-TR',{minimumFractionDigits:v>=100?2:4,maximumFractionDigits:v>=100?2:8}).format(v);
-const cash=v=>`${money.format(v)} USDT`;
+const clean=v=>Math.abs(v)<0.005?0:v;
+const cash=v=>`${money.format(clean(v))} USDT`;
 const tone=(el,v)=>{el.classList.toggle('positive',v>0);el.classList.toggle('negative',v<0)};
 function setMoney(id,v){const e=document.getElementById(id);e.textContent=cash(v);tone(e,v)}
 function render(d){
@@ -201,7 +203,7 @@ function render(d){
  document.querySelector('.dot').style.background=d.entries_paused?'#ff5277':'#26d99a';
  setMoney('balance',d.balance);setMoney('realized',d.realized_net_pnl);setMoney('unrealized',d.unrealized_net_pnl);
  document.getElementById('used').textContent=cash(d.used_margin);document.getElementById('free').textContent=cash(d.free_margin);
- document.getElementById('tracked').textContent=money.format(d.tracked_symbols);
+ document.getElementById('tracked').textContent=count.format(d.tracked_symbols);
  document.getElementById('summary').textContent=`${d.positions.length} pozisyon · ${d.strategy_version}`;
  const root=document.getElementById('positions');root.replaceChildren();
  if(!d.positions.length){const e=document.createElement('div');e.className='empty';e.textContent='Henüz açık pozisyon yok.';root.append(e);return}
