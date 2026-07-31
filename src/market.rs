@@ -123,8 +123,11 @@ impl Universe {
                     _ => {}
                 }
             }
-            if meta.tick_size > 0.0 && meta.step_size > 0.0 && meta.min_quantity > 0.0
-                && meta.min_notional > 0.0 {
+            if meta.tick_size > 0.0
+                && meta.step_size > 0.0
+                && meta.min_quantity > 0.0
+                && meta.min_notional > 0.0
+            {
                 next.push((symbol.symbol, meta));
             }
         }
