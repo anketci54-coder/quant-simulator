@@ -327,9 +327,10 @@ fn apply_message_at(
                     let midpoint = (ticker.bid + ticker.ask) / 2.0;
                     state.last_price = midpoint;
                     state.price_received_at = received_at;
-                    let sample_due = state.samples.back().is_none_or(|last| {
-                        received_at.saturating_sub(last.event_time) >= 1_000
-                    });
+                    let sample_due = state
+                        .samples
+                        .back()
+                        .is_none_or(|last| received_at.saturating_sub(last.event_time) >= 1_000);
                     if sample_due {
                         let quote_volume = state.quote_volume;
                         state.push_sample(MarketSample {
