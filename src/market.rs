@@ -41,6 +41,10 @@ impl Universe {
         self.symbols.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
+    }
+
     pub fn symbols(&self) -> HashSet<String> {
         self.symbols
             .iter()
@@ -98,6 +102,12 @@ impl Universe {
             self.symbols.insert(symbol, meta);
         }
         Ok(())
+    }
+}
+
+impl Default for Universe {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

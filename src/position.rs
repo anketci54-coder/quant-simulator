@@ -64,6 +64,15 @@ pub struct PositionPolicy {
     pub runner_atr_multiple: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PositionQuote {
+    pub bid: f64,
+    pub ask: f64,
+    pub atr: f64,
+    pub structure_stop: Option<f64>,
+    pub step_size: f64,
+}
+
 impl Default for PositionPolicy {
     fn default() -> Self {
         Self {
@@ -158,27 +167,23 @@ impl Position {
     /// are 40% + 40% of the original quantity; the last 20% has no fixed TP.
     pub fn on_quote(
         &mut self,
-        bid: f64,
-        ask: f64,
-        atr: f64,
-        structure_stop: Option<f64>,
-        step_size: f64,
+        quote: PositionQuote,
         costs: CostModel,
         policy: PositionPolicy,
     ) -> Vec<PositionEvent> {
         let mut events = Vec::new();
         if self.stage == PositionStage::Closed
-            || bid <= 0.0
-            || ask < bid
-            || atr <= 0.0
-            || step_size <= 0.0
+            || quote.bid <= 0.0
+            || quote.ask < quote.bid
+            || quote.atr <= 0.0
+            || quote.step_size <= 0.0
             || !policy.validate()
         {
             return events;
         }
 
-        let executable = self.side.favorable_price(bid, ask);
-        if let Some(exit_fill) = costs.estimated_exit_fill(self.side, bid, ask) {
+        let executable = self.side.favorable_price(quote.bid, quote.ask);
+        if let Some(exit_fill) = costs.estimated_exit_fill(self.side, quote.bid, quote.ask) {
             self.last_exit_fill = exit_fill;
         }
         self.favorable_extreme = match self.side {
@@ -186,9 +191,9 @@ impl Position {
             Side::Short => self.favorable_extreme.min(executable),
         };
 
-        self.apply_protective_stop(costs, policy, atr, structure_stop, &mut events);
+        self.apply_protective_stop(costs, policy, quote.atr, quote.structure_stop, &mut events);
 
-        if self.side.stop_is_hit(bid, ask, self.stop) {
+        if self.side.stop_is_hit(quote.bid, quote.ask, self.stop) {
             let reason = match self.stage {
                 PositionStage::BeforeTp1 if self.stop == self.initial_stop => {
                     ExitReason::InitialStop
@@ -198,16 +203,14 @@ impl Position {
                 PositionStage::Runner => ExitReason::RunnerTrail,
                 PositionStage::Closed => return events,
             };
-            self.close_remaining(bid, ask, costs, reason, &mut events);
+            self.close_remaining(quote.bid, quote.ask, costs, reason, &mut events);
             return events;
         }
 
         if self.stage == PositionStage::BeforeTp1 && self.target_reached(executable, self.tp1) {
             self.partial_exit(
                 policy.tp1_fraction,
-                bid,
-                ask,
-                step_size,
+                quote,
                 costs,
                 PositionStage::AfterTp1,
                 &mut events,
@@ -218,15 +221,13 @@ impl Position {
         if self.stage == PositionStage::AfterTp1 && self.target_reached(executable, self.tp2) {
             self.partial_exit(
                 policy.tp2_fraction,
-                bid,
-                ask,
-                step_size,
+                quote,
                 costs,
                 PositionStage::Runner,
                 &mut events,
             );
             self.raise_stop_to_tp1(&mut events);
-            self.apply_runner_trail(atr, structure_stop, policy, &mut events);
+            self.apply_runner_trail(quote.atr, quote.structure_stop, policy, &mut events);
         }
 
         events
@@ -378,19 +379,17 @@ impl Position {
     fn partial_exit(
         &mut self,
         fraction_of_original: f64,
-        bid: f64,
-        ask: f64,
-        step_size: f64,
+        quote: PositionQuote,
         costs: CostModel,
         next_stage: PositionStage,
         events: &mut Vec<PositionEvent>,
     ) {
         let desired = self.original_quantity * fraction_of_original;
-        let quantity = round_down(desired, step_size).min(self.remaining_quantity);
+        let quantity = round_down(desired, quote.step_size).min(self.remaining_quantity);
         if quantity <= 0.0 {
             return;
         }
-        let Some(exit_fill) = costs.estimated_exit_fill(self.side, bid, ask) else {
+        let Some(exit_fill) = costs.estimated_exit_fill(self.side, quote.bid, quote.ask) else {
             return;
         };
         let entry_fee = self.allocated_entry_fee(quantity);
@@ -485,6 +484,16 @@ fn round_down(value: f64, step_size: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn quote(bid: f64, ask: f64, atr: f64, structure_stop: Option<f64>) -> PositionQuote {
+        PositionQuote {
+            bid,
+            ask,
+            atr,
+            structure_stop,
+            step_size: 0.1,
+        }
+    }
+
     fn position(side: Side) -> Position {
         match side {
             Side::Long => {
@@ -505,22 +514,14 @@ mod tests {
                 Side::Short => (97.8, 97.9, 95.8, 95.9),
             };
             position.on_quote(
-                tp1_bid,
-                tp1_ask,
-                0.5,
-                None,
-                0.1,
+                quote(tp1_bid, tp1_ask, 0.5, None),
                 CostModel::default(),
                 PositionPolicy::default(),
             );
             assert_eq!(position.stage, PositionStage::AfterTp1);
             assert!((position.remaining_quantity - 6.0).abs() < EPSILON);
             position.on_quote(
-                tp2_bid,
-                tp2_ask,
-                0.5,
-                None,
-                0.1,
+                quote(tp2_bid, tp2_ask, 0.5, None),
                 CostModel::default(),
                 PositionPolicy::default(),
             );
@@ -538,9 +539,9 @@ mod tests {
         let mut position = position(Side::Long);
         let policy = PositionPolicy::default();
         let costs = CostModel::default();
-        position.on_quote(101.5, 101.6, 0.5, None, 0.1, costs, policy);
+        position.on_quote(quote(101.5, 101.6, 0.5, None), costs, policy);
         let raised = position.stop;
-        position.on_quote(100.8, 100.9, 2.0, Some(99.0), 0.1, costs, policy);
+        position.on_quote(quote(100.8, 100.9, 2.0, Some(99.0)), costs, policy);
         assert!(position.stop >= raised);
     }
 
@@ -549,13 +550,13 @@ mod tests {
         let mut position = position(Side::Long);
         let policy = PositionPolicy::default();
         let costs = CostModel::default();
-        position.on_quote(102.1, 102.2, 0.5, None, 0.1, costs, policy);
-        position.on_quote(104.1, 104.2, 0.5, None, 0.1, costs, policy);
-        position.on_quote(110.0, 110.1, 0.5, None, 0.1, costs, policy);
+        position.on_quote(quote(102.1, 102.2, 0.5, None), costs, policy);
+        position.on_quote(quote(104.1, 104.2, 0.5, None), costs, policy);
+        position.on_quote(quote(110.0, 110.1, 0.5, None), costs, policy);
         assert_eq!(position.stage, PositionStage::Runner);
         assert!(position.stop > 104.0);
         let stop = position.stop;
-        let events = position.on_quote(stop - 0.01, stop, 0.5, None, 0.1, costs, policy);
+        let events = position.on_quote(quote(stop - 0.01, stop, 0.5, None), costs, policy);
         assert_eq!(position.stage, PositionStage::Closed);
         assert!(events.iter().any(|event| matches!(
             event,

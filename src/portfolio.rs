@@ -7,7 +7,7 @@ use crate::{
     cost::CostModel,
     market::SymbolMeta,
     model::{Candidate, Side, STRATEGY_VERSION},
-    position::{ExitReason, Position, PositionEvent, PositionPolicy, PositionStage},
+    position::{ExitReason, Position, PositionEvent, PositionPolicy, PositionQuote, PositionStage},
     risk::{cost_adjusted_risk_to_stop, size_candidate, PositionSize, RiskLimits},
     storage::{LedgerEvent, PortfolioSnapshot, SignalDecision, SqliteStore, TrackedPosition},
 };
@@ -321,11 +321,13 @@ impl PortfolioEngine {
         let (position_id, side, events) = {
             let tracked = &mut self.snapshot.positions[index];
             let events = tracked.position.on_quote(
-                quote.bid,
-                quote.ask,
-                quote.atr,
-                quote.structure_stop,
-                step_size,
+                PositionQuote {
+                    bid: quote.bid,
+                    ask: quote.ask,
+                    atr: quote.atr,
+                    structure_stop: quote.structure_stop,
+                    step_size,
+                },
                 self.costs,
                 self.policy,
             );
