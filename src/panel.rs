@@ -11,7 +11,10 @@ use axum::{
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::model::{Side, STRATEGY_VERSION};
+use crate::{
+    model::{Side, STRATEGY_VERSION},
+    portfolio::EmergencyExitSummary,
+};
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct DashboardSnapshot {
@@ -50,7 +53,7 @@ pub struct PositionView {
 }
 
 pub struct EmergencyCommand {
-    pub reply: oneshot::Sender<std::result::Result<usize, String>>,
+    pub reply: oneshot::Sender<std::result::Result<EmergencyExitSummary, String>>,
 }
 
 #[derive(Clone)]
@@ -111,9 +114,10 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
             .into_response();
     }
     match reply_rx.await {
-        Ok(Ok(closed)) => Json(serde_json::json!({
+        Ok(Ok(summary)) => Json(serde_json::json!({
             "ok": true,
-            "closed_positions": closed,
+            "closed_positions": summary.closed_positions,
+            "fallback_quotes": summary.fallback_quotes,
             "entries_paused": true
         }))
         .into_response(),

@@ -20,6 +20,12 @@ pub struct Quote {
     pub structure_stop: Option<f64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmergencyExitSummary {
+    pub closed_positions: usize,
+    pub fallback_quotes: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EntryReject {
     EntriesPaused,
@@ -406,16 +412,27 @@ impl PortfolioEngine {
         &mut self,
         quotes: &HashMap<String, Quote>,
         now: i64,
-    ) -> Result<usize> {
+    ) -> Result<EmergencyExitSummary> {
         let before = self.snapshot.clone();
         self.snapshot.entries_paused = true;
         self.snapshot.pause_reason = Some("EMERGENCY_EXIT".to_string());
         let mut ledger = Vec::new();
         let mut closed = 0usize;
+        let mut fallback_quotes = 0usize;
 
         for tracked in &mut self.snapshot.positions {
-            let Some(quote) = quotes.get(&tracked.symbol) else {
-                continue;
+            let quote = match quotes.get(&tracked.symbol).copied() {
+                Some(quote) => quote,
+                None => {
+                    fallback_quotes += 1;
+                    let last = tracked.position.last_exit_fill.max(f64::EPSILON);
+                    Quote {
+                        bid: last,
+                        ask: last,
+                        atr: f64::EPSILON,
+                        structure_stop: None,
+                    }
+                }
             };
             let events = tracked.position.force_close(
                 quote.bid,
@@ -446,7 +463,10 @@ impl PortfolioEngine {
             self.snapshot = before;
             return Err(error).context("Acil çıkış atomik kaydedilemedi");
         }
-        Ok(closed)
+        Ok(EmergencyExitSummary {
+            closed_positions: closed,
+            fallback_quotes,
+        })
     }
 
     fn apply_events(
@@ -477,6 +497,136 @@ impl PortfolioEngine {
             ));
         }
         ledger
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::*;
+    use crate::{
+        model::FeatureSnapshot,
+        storage::{PortfolioSnapshot, SqliteStore},
+    };
+
+    fn temp_database() -> (std::path::PathBuf, Arc<SqliteStore>) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("quant-v4-portfolio-{unique}.db"));
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        (path, store)
+    }
+
+    fn engine(store: Arc<SqliteStore>) -> PortfolioEngine {
+        PortfolioEngine::new(
+            PortfolioSnapshot::fresh(10_000.0),
+            store,
+            CostModel::default(),
+            PositionPolicy::default(),
+            PortfolioLimits {
+                max_positions: 10,
+                leverage: 3.0,
+                risk_per_trade: 0.005,
+                max_portfolio_risk: 0.02,
+                max_trade_allocation: 0.10,
+            },
+        )
+        .unwrap()
+    }
+
+    fn candidate(symbol: &str, side: Side, observed_at: i64) -> Candidate {
+        Candidate {
+            symbol: symbol.to_string(),
+            side,
+            price: 100.0,
+            score: 80.0,
+            confidence: 0.8,
+            stop_distance: 1.0,
+            liquidity_notional: 1_000_000.0,
+            observed_at,
+            features: FeatureSnapshot::default(),
+        }
+    }
+
+    fn meta() -> SymbolMeta {
+        SymbolMeta {
+            tick_size: 0.01,
+            step_size: 0.1,
+            min_quantity: 0.1,
+        }
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn emergency_exit_closes_every_position_and_persists_pause_across_restart() {
+        let (path, store) = temp_database();
+        let mut portfolio = engine(store.clone());
+        let entry_quote = Quote {
+            bid: 99.99,
+            ask: 100.01,
+            atr: 0.5,
+            structure_stop: None,
+        };
+        portfolio
+            .try_open(
+                &candidate("LONGUSDT", Side::Long, 1),
+                &meta(),
+                entry_quote,
+                "SYMBOL_BULL",
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        portfolio
+            .try_open(
+                &candidate("SHORTUSDT", Side::Short, 2),
+                &meta(),
+                entry_quote,
+                "SYMBOL_BEAR",
+                2,
+            )
+            .unwrap()
+            .unwrap();
+
+        let quotes = HashMap::from([(
+            "LONGUSDT".to_string(),
+            Quote {
+                bid: 101.0,
+                ask: 101.01,
+                atr: 0.5,
+                structure_stop: None,
+            },
+        )]);
+        let summary = portfolio.emergency_close_all(&quotes, 3).unwrap();
+        assert_eq!(
+            summary,
+            EmergencyExitSummary {
+                closed_positions: 2,
+                fallback_quotes: 1,
+            }
+        );
+        assert!(portfolio.snapshot().positions.is_empty());
+        assert!(portfolio.snapshot().entries_paused);
+
+        drop(portfolio);
+        let restored = store.load_or_create(1.0, 4).unwrap();
+        assert!(restored.positions.is_empty());
+        assert!(restored.entries_paused);
+        assert_eq!(restored.pause_reason.as_deref(), Some("EMERGENCY_EXIT"));
+        drop(store);
+        cleanup(&path);
     }
 }
 
