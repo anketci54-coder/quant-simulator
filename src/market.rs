@@ -323,6 +323,22 @@ fn apply_message_at(
                 state.bid_quantity = ticker.bid_quantity;
                 state.ask_quantity = ticker.ask_quantity;
                 state.book_received_at = received_at;
+                if ticker.bid > 0.0 && ticker.ask > ticker.bid {
+                    let midpoint = (ticker.bid + ticker.ask) / 2.0;
+                    state.last_price = midpoint;
+                    state.price_received_at = received_at;
+                    let sample_due = state.samples.back().is_none_or(|last| {
+                        received_at.saturating_sub(last.event_time) >= 1_000
+                    });
+                    if sample_due {
+                        let quote_volume = state.quote_volume;
+                        state.push_sample(MarketSample {
+                            event_time: received_at,
+                            price: midpoint,
+                            quote_volume,
+                        });
+                    }
+                }
                 applied.book_tickers += 1;
             }
         }
@@ -478,9 +494,11 @@ mod tests {
 
         assert_eq!(stats.book_tickers, 1);
         let state = store.get("BTCUSDT").unwrap();
-        assert_eq!(state.price_received_at, 50_000);
         assert_eq!(state.book_received_at, 50_100);
         assert_eq!(state.bid, 64_999.0);
         assert_eq!(state.ask, 65_001.0);
+        assert_eq!(state.last_price, 65_000.0);
+        assert_eq!(state.price_received_at, 50_100);
+        assert_eq!(state.samples.back().unwrap().price, 65_000.0);
     }
 }
