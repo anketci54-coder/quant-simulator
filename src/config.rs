@@ -86,7 +86,7 @@ impl Config {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
-            bail!("PANEL_ACTION_TOKEN 32-128 karakter ve URL-gÃ¼venli olmalÄ±");
+            bail!("PANEL_ACTION_TOKEN 32-128 karakter ve URL-güvenli olmalı");
         }
         if !(1.0..=3.0).contains(&self.leverage) {
             bail!("LEVERAGE must be between 1 and 3");
