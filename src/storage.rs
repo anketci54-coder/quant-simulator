@@ -310,6 +310,26 @@ impl SqliteStore {
             .context("SQLite WAL checkpoint başarısız")
     }
 
+    /// Keeps accepted training labels indefinitely while bounding noisy gate
+    /// rejection telemetry. Execution and position ledgers are never pruned.
+    pub fn maintain(&self, rejected_before: i64) -> Result<usize> {
+        let mut connection = self.lock()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("SQLite bakım transaction başlatılamadı")?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM signal_decisions WHERE accepted = 0 AND observed_at < ?1",
+                params![rejected_before],
+            )
+            .context("Eski sinyal retleri temizlenemedi")?;
+        transaction.commit().context("SQLite bakım commit başarısız")?;
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .context("SQLite bakım checkpoint başarısız")?;
+        Ok(deleted)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
         self.connection
             .lock()
