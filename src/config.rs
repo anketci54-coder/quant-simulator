@@ -5,7 +5,8 @@ use anyhow::{bail, Context, Result};
 #[derive(Clone, Debug)]
 pub struct Config {
     pub rest_base_url: String,
-    pub websocket_url: String,
+    pub market_websocket_url: String,
+    pub book_websocket_url: String,
     pub database_path: String,
     pub panel_bind: SocketAddr,
     pub panel_action_token: String,
@@ -23,7 +24,8 @@ pub struct Config {
     pub min_quote_volume: f64,
     pub max_spread_percent: f64,
     pub hot_set_size: usize,
-    pub stale_after: Duration,
+    pub price_stale_after: Duration,
+    pub book_stale_after: Duration,
 }
 
 impl Config {
@@ -31,8 +33,12 @@ impl Config {
         let config = Self {
             rest_base_url: env::var("BINANCE_BASE_URL")
                 .unwrap_or_else(|_| "https://fapi.binance.com".to_string()),
-            websocket_url: env::var("BINANCE_WS_URL").unwrap_or_else(|_| {
-                "wss://fstream.binance.com/stream?streams=!miniTicker@arr/!bookTicker/!markPrice@arr@1s".to_string()
+            market_websocket_url: env::var("BINANCE_MARKET_WS_URL").unwrap_or_else(|_| {
+                "wss://fstream.binance.com/market/stream?streams=!miniTicker@arr/!markPrice@arr@1s"
+                    .to_string()
+            }),
+            book_websocket_url: env::var("BINANCE_BOOK_WS_URL").unwrap_or_else(|_| {
+                "wss://fstream.binance.com/public/stream?streams=!bookTicker".to_string()
             }),
             database_path: env::var("DATABASE_PATH")
                 .unwrap_or_else(|_| "quant_history_v4.db".to_string()),
@@ -58,8 +64,11 @@ impl Config {
             min_quote_volume: parse("MIN_QUOTE_VOLUME", 20_000_000f64)?,
             max_spread_percent: parse("MAX_SPREAD_PERCENT", 0.10f64)?,
             hot_set_size: parse("HOT_SET_SIZE", 64usize)?.clamp(8, 256),
-            stale_after: Duration::from_millis(
+            price_stale_after: Duration::from_millis(
                 parse("MARKET_STALE_AFTER_MS", 5_000u64)?.clamp(1_000, 60_000),
+            ),
+            book_stale_after: Duration::from_millis(
+                parse("BOOK_STALE_AFTER_MS", 15_000u64)?.clamp(5_000, 60_000),
             ),
         };
         config.validate()?;
@@ -77,7 +86,7 @@ impl Config {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
-            bail!("PANEL_ACTION_TOKEN 32-128 karakter ve URL-güvenli olmalı");
+            bail!("PANEL_ACTION_TOKEN 32-128 karakter ve URL-gÃ¼venli olmalÄ±");
         }
         if !(1.0..=3.0).contains(&self.leverage) {
             bail!("LEVERAGE must be between 1 and 3");
