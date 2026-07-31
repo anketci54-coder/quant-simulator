@@ -323,7 +323,9 @@ impl SqliteStore {
                 params![rejected_before],
             )
             .context("Eski sinyal retleri temizlenemedi")?;
-        transaction.commit().context("SQLite bakım commit başarısız")?;
+        transaction
+            .commit()
+            .context("SQLite bakım commit başarısız")?;
         connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .context("SQLite bakım checkpoint başarısız")?;
