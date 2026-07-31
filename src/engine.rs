@@ -14,6 +14,31 @@ use crate::{
 
 pub type HotSet = Arc<watch::Sender<Vec<Candidate>>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateReject {
+    Stale,
+    Warmup,
+    LowVolume,
+    InvalidSpread,
+    WeakScore,
+    NeutralDirection,
+    ConflictingSignals,
+}
+
+impl CandidateReject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "STALE",
+            Self::Warmup => "WARMUP",
+            Self::LowVolume => "LOW_VOLUME",
+            Self::InvalidSpread => "INVALID_SPREAD",
+            Self::WeakScore => "WEAK_SCORE",
+            Self::NeutralDirection => "NEUTRAL_DIRECTION",
+            Self::ConflictingSignals => "CONFLICTING_SIGNALS",
+        }
+    }
+}
+
 pub async fn run_feature_engine(
     config: Config,
     store: SymbolStore,
@@ -35,7 +60,7 @@ pub async fn run_feature_engine(
                 for mut entry in store.iter_mut() {
                     let features = calculate_features(&entry, now);
                     entry.features = features;
-                    if let Some(candidate) = candidate_from(&config, &entry, now) {
+                    if let Ok(candidate) = candidate_from(&config, &entry, now) {
                         candidates.push(candidate);
                     }
                 }
@@ -68,7 +93,6 @@ fn calculate_features(state: &SymbolState, now: i64) -> FeatureSnapshot {
     FeatureSnapshot {
         return_15s,
         return_60s,
-
         return_300s,
         volume_impulse,
         volatility,
@@ -79,26 +103,59 @@ fn calculate_features(state: &SymbolState, now: i64) -> FeatureSnapshot {
     }
 }
 
-fn candidate_from(config: &Config, state: &SymbolState, now: i64) -> Option<Candidate> {
+fn candidate_from(
+    config: &Config,
+    state: &SymbolState,
+    now: i64,
+) -> Result<Candidate, CandidateReject> {
     let features = state.features;
     if now.saturating_sub(state.event_time) > config.stale_after.as_millis() as i64
-        || state.quote_volume < config.min_quote_volume
-        || features.spread_percent > config.max_spread_percent
-        || features.cheap_score < 55.0
         || state.last_price <= 0.0
     {
-        return None;
+        return Err(CandidateReject::Stale);
+    }
+    let window_ready = state.samples.len() >= 30
+        && state
+            .samples
+            .front()
+            .is_some_and(|sample| sample.event_time <= now - 30_000);
+    if !window_ready {
+        return Err(CandidateReject::Warmup);
+    }
+    if state.quote_volume < config.min_quote_volume {
+        return Err(CandidateReject::LowVolume);
+    }
+    if !features.spread_percent.is_finite() || features.spread_percent > config.max_spread_percent {
+        return Err(CandidateReject::InvalidSpread);
+    }
+    if features.cheap_score < 55.0 {
+        return Err(CandidateReject::WeakScore);
     }
     let direction =
         features.return_15s * 0.5 + features.return_60s * 0.35 + features.book_imbalance * 0.15;
-    let side = if direction > 0.0 {
+    let side = if direction >= 0.03 {
         Side::Long
-    } else {
+    } else if direction <= -0.03 {
         Side::Short
+    } else {
+        return Err(CandidateReject::NeutralDirection);
     };
+    let signed_votes = [
+        features.return_15s.signum(),
+        features.return_60s.signum(),
+        features.book_imbalance.signum(),
+    ]
+    .into_iter()
+    .filter(|sign| *sign == side.direction())
+    .count();
+    if signed_votes < 2 {
+        return Err(CandidateReject::ConflictingSignals);
+    }
     let confidence = (features.cheap_score / 100.0).clamp(0.35, 1.0);
-    let stop_percent = (features.volatility * 2.2).clamp(0.004, 0.018);
-    Some(Candidate {
+    // realized_volatility is in percentage points; convert to a decimal
+    // fraction before applying the ATR-like stop multiplier.
+    let stop_percent = (features.volatility / 100.0 * 2.2).clamp(0.004, 0.018);
+    Ok(Candidate {
         symbol: state.symbol.clone(),
         side,
         price: state.last_price,
@@ -219,6 +276,31 @@ mod tests {
         }
     }
 
+    fn config() -> Config {
+        Config {
+            rest_base_url: "https://example.test".to_string(),
+            websocket_url: "wss://example.test".to_string(),
+            database_path: "test.db".to_string(),
+            panel_bind: "127.0.0.1:8080".parse().unwrap(),
+            panel_action_token: "0123456789abcdef0123456789abcdef".to_string(),
+            initial_balance: 10_000.0,
+            entry_enabled: true,
+            max_positions: 10,
+            leverage: 3.0,
+            risk_per_trade: 0.005,
+            max_portfolio_risk: 0.02,
+            max_trade_allocation: 0.10,
+            taker_fee_rate: 0.0004,
+            expected_entry_slippage_bps: 1.0,
+            expected_exit_slippage_bps: 2.0,
+            break_even_safety_bps: 1.0,
+            min_quote_volume: 20_000_000.0,
+            max_spread_percent: 0.10,
+            hot_set_size: 64,
+            stale_after: Duration::from_secs(5),
+        }
+    }
+
     #[test]
     fn coalescing_keeps_latest_symbol_state_without_fifo_backlog() {
         let result = coalesce_candidates([
@@ -229,5 +311,41 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].symbol, "BUSDT");
         assert_eq!(result[1].observed_at, 2);
+    }
+
+    #[test]
+    fn bearish_symbol_can_generate_short_without_btc_regime_gate() {
+        let now = 100_000;
+        let mut state = SymbolState {
+            symbol: "ALTUSDT".to_string(),
+            last_price: 99.0,
+            bid: 98.99,
+            ask: 99.01,
+            bid_quantity: 1_000.0,
+            ask_quantity: 2_000.0,
+            quote_volume: 30_000_000.0,
+            event_time: now,
+            features: FeatureSnapshot {
+                return_15s: -0.20,
+                return_60s: -0.40,
+                return_300s: -0.80,
+                volume_impulse: 0.01,
+                volatility: 0.20,
+                spread_percent: 0.02,
+                book_imbalance: -0.40,
+                cheap_score: 80.0,
+                updated_at: now,
+            },
+            ..SymbolState::default()
+        };
+        for second in 0..=30 {
+            state.push_sample(crate::model::MarketSample {
+                event_time: now - (30 - second) * 1_000,
+                price: 100.0 - second as f64 * 0.03,
+                quote_volume: 30_000_000.0,
+            });
+        }
+        let result = candidate_from(&config(), &state, now).unwrap();
+        assert_eq!(result.side, Side::Short);
     }
 }

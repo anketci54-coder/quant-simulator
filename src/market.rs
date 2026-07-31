@@ -9,17 +9,17 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::{
     config::Config,
-    model::{BookTicker, CombinedEvent, MarketSample, MiniTicker, SymbolState},
+    model::{BookTicker, CombinedEvent, MarkPrice, MarketSample, MiniTicker, SymbolState},
 };
 
 pub type SymbolStore = Arc<DashMap<String, SymbolState>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Universe {
     symbols: Arc<DashMap<String, SymbolMeta>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct SymbolMeta {
     pub tick_size: f64,
     pub step_size: f64,
@@ -41,15 +41,15 @@ impl Universe {
         self.symbols.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.symbols.is_empty()
-    }
-
     pub fn symbols(&self) -> HashSet<String> {
         self.symbols
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    pub fn meta(&self, symbol: &str) -> Option<SymbolMeta> {
+        self.symbols.get(symbol).map(|entry| *entry)
     }
 
     pub async fn refresh(&self, client: &reqwest::Client, config: &Config) -> Result<()> {
@@ -142,7 +142,6 @@ pub async fn run_market_stream(
                         changed = shutdown.changed() => {
                             if changed.is_err() || *shutdown.borrow() {
                                 return;
-
                             }
                         }
                         message = reader.next() => {
@@ -212,6 +211,26 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
                 state.bid_quantity = ticker.bid_quantity;
                 state.ask_quantity = ticker.ask_quantity;
                 state.event_time = state.event_time.max(ticker.event_time);
+            }
+        }
+    } else if event.stream.contains("markPrice") {
+        let prices: Vec<MarkPrice> = if event.data.is_array() {
+            serde_json::from_value(event.data)?
+        } else {
+            vec![serde_json::from_value(event.data)?]
+        };
+        for price in prices {
+            if universe.contains(&price.symbol) {
+                let mut state = store
+                    .entry(price.symbol.clone())
+                    .or_insert_with(|| SymbolState {
+                        symbol: price.symbol.clone(),
+                        ..SymbolState::default()
+                    });
+                state.mark_price = price.mark_price;
+                state.funding_rate = price.funding_rate;
+                state.next_funding_time = price.next_funding_time;
+                state.event_time = state.event_time.max(price.event_time);
             }
         }
     }

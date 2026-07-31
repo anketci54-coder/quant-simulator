@@ -14,6 +14,9 @@ pub struct SymbolState {
     pub bid_quantity: f64,
     pub ask_quantity: f64,
     pub quote_volume: f64,
+    pub mark_price: f64,
+    pub funding_rate: f64,
+    pub next_funding_time: i64,
     pub event_time: i64,
     pub samples: VecDeque<MarketSample>,
     pub features: FeatureSnapshot,
@@ -88,6 +91,29 @@ pub enum Side {
     Short,
 }
 
+impl Side {
+    pub fn direction(self) -> f64 {
+        match self {
+            Self::Long => 1.0,
+            Self::Short => -1.0,
+        }
+    }
+
+    pub fn favorable_price(self, bid: f64, ask: f64) -> f64 {
+        match self {
+            Self::Long => bid,
+            Self::Short => ask,
+        }
+    }
+
+    pub fn stop_is_hit(self, bid: f64, ask: f64, stop: f64) -> bool {
+        match self {
+            Self::Long => bid <= stop,
+            Self::Short => ask >= stop,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct CombinedEvent {
     pub stream: String,
@@ -120,6 +146,20 @@ pub struct BookTicker {
     pub ask: f64,
     #[serde(rename = "A", deserialize_with = "de_f64")]
     pub ask_quantity: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MarkPrice {
+    #[serde(rename = "E")]
+    pub event_time: i64,
+    #[serde(rename = "s")]
+    pub symbol: String,
+    #[serde(rename = "p", deserialize_with = "de_f64")]
+    pub mark_price: f64,
+    #[serde(rename = "r", deserialize_with = "de_f64")]
+    pub funding_rate: f64,
+    #[serde(rename = "T")]
+    pub next_funding_time: i64,
 }
 
 fn de_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
