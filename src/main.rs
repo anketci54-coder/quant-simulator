@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -15,7 +15,7 @@ use quant_bot::{
     model::Side,
     panel::{run_panel, DashboardSnapshot, EmergencyCommand, PositionView},
     portfolio::{PortfolioEngine, PortfolioLimits, Quote},
-    position::{PositionPolicy, PositionStage},
+    position::{PositionEvent, PositionPolicy, PositionStage},
     storage::SqliteStore,
 };
 use tokio::{
@@ -66,10 +66,14 @@ async fn main() -> Result<()> {
         PositionPolicy::default(),
         PortfolioLimits {
             max_positions: config.max_positions,
+            max_same_side_positions: config.max_same_side_positions,
             leverage: config.leverage,
             risk_per_trade: config.risk_per_trade,
             max_portfolio_risk: config.max_portfolio_risk,
             max_trade_allocation: config.max_trade_allocation,
+            max_total_margin_fraction: config.max_total_margin_fraction,
+            min_trade_notional: config.min_trade_notional,
+            min_expected_net_profit: config.min_expected_net_profit,
         },
     )?;
 
@@ -114,6 +118,8 @@ async fn main() -> Result<()> {
     let mut dashboard_interval = time::interval(Duration::from_secs(1));
     dashboard_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut last_entry_attempt: HashMap<String, i64> = HashMap::new();
+    let mut symbol_cooldown_until: HashMap<String, i64> = HashMap::new();
+    let mut recent_entries: VecDeque<i64> = VecDeque::new();
     let mut funding_schedule: HashMap<String, (i64, f64)> = HashMap::new();
     let shutdown_signal = shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -152,11 +158,17 @@ async fn main() -> Result<()> {
                     let mark_price = state.mark_price;
                     drop(state);
 
-                    portfolio
+                    let events = portfolio
                         .process_quote(&symbol, quote, meta.step_size, now)
                         .with_context(|| {
                             format!("{symbol} pozisyon güncellemesi başarısız")
                         })?;
+                    if events.iter().any(|event| matches!(event, PositionEvent::Closed { .. })) {
+                        symbol_cooldown_until.insert(
+                            symbol.clone(),
+                            now.saturating_add(config.symbol_cooldown.as_millis() as i64),
+                        );
+                    }
 
                     if next_funding > 0 {
                         match funding_schedule.insert(
@@ -248,6 +260,9 @@ async fn main() -> Result<()> {
                     );
                 }
                 if config.entry_enabled && !portfolio.snapshot().entries_paused {
+                    while recent_entries.front().is_some_and(|entry| now.saturating_sub(*entry) >= 60_000) {
+                        recent_entries.pop_front();
+                    }
                     for candidate in &frame.candidates {
                         if portfolio.snapshot().positions.len() >= config.max_positions {
                             break;
@@ -257,6 +272,15 @@ async fn main() -> Result<()> {
                             .is_some_and(|last| now.saturating_sub(*last) < 60_000)
                         {
                             continue;
+                        }
+                        if symbol_cooldown_until
+                            .get(&candidate.symbol)
+                            .is_some_and(|until| now < *until)
+                        {
+                            continue;
+                        }
+                        if recent_entries.len() >= config.max_entries_per_minute {
+                            break;
                         }
                         let (Some(state), Some(meta)) = (
                             store.get(&candidate.symbol),
@@ -282,6 +306,7 @@ async fn main() -> Result<()> {
                                 format!("{} giriş kararı kaydedilemedi", candidate.symbol)
                             })?;
                         if let Ok(position_id) = result {
+                            recent_entries.push_back(now);
                             println!(
                                 "OPEN id={} symbol={} side={:?} confidence={:.2}",
                                 position_id,
