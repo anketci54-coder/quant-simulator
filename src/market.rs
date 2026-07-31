@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, str, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
@@ -151,7 +151,12 @@ pub async fn run_market_stream(
         match connect_async(&config.websocket_url).await {
             Ok((stream, _)) => {
                 backoff = 1;
+                println!("Market stream connected");
                 let (_, mut reader) = stream.split();
+                let mut applied_events = 0usize;
+                let mut health_interval = time::interval(Duration::from_secs(60));
+                health_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                health_interval.tick().await;
                 loop {
                     tokio::select! {
                         changed = shutdown.changed() => {
@@ -159,11 +164,31 @@ pub async fn run_market_stream(
                                 return;
                             }
                         }
+                        _ = health_interval.tick() => {
+                            println!(
+                                "market_stream_health applied_events_60s={} active_symbols={}",
+                                applied_events,
+                                store.len()
+                            );
+                            applied_events = 0;
+                        }
                         message = reader.next() => {
                             match message {
                                 Some(Ok(Message::Text(text))) => {
-                                    if let Err(error) = apply_message(&text, &universe, &store) {
-                                        eprintln!("Market event rejected: {error:#}");
+                                    match apply_message(&text, &universe, &store) {
+                                        Ok(applied) => applied_events += applied,
+                                        Err(error) => eprintln!("Market event rejected: {error:#}"),
+                                    }
+                                }
+                                Some(Ok(Message::Binary(bytes))) => {
+                                    match str::from_utf8(&bytes)
+                                        .map_err(anyhow::Error::from)
+                                        .and_then(|text| apply_message(text, &universe, &store))
+                                    {
+                                        Ok(applied) => applied_events += applied,
+                                        Err(error) => {
+                                            eprintln!("Binary market event rejected: {error:#}")
+                                        }
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) | None => break,
@@ -184,9 +209,11 @@ pub async fn run_market_stream(
     }
 }
 
-fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result<()> {
+fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result<usize> {
     let event: CombinedEvent = serde_json::from_str(text)?;
-    if event.stream.contains("miniTicker") {
+    let stream_name = event.stream.to_ascii_lowercase();
+    let mut applied = 0usize;
+    if stream_name.contains("miniticker") {
         let tickers: Vec<MiniTicker> = serde_json::from_value(event.data)?;
         for ticker in tickers {
             if !universe.contains(&ticker.symbol) {
@@ -206,8 +233,9 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
                 price: ticker.close,
                 quote_volume: ticker.quote_volume,
             });
+            applied += 1;
         }
-    } else if event.stream.contains("bookTicker") {
+    } else if stream_name.contains("bookticker") {
         let tickers: Vec<BookTicker> = if event.data.is_array() {
             serde_json::from_value(event.data)?
         } else {
@@ -226,9 +254,10 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
                 state.bid_quantity = ticker.bid_quantity;
                 state.ask_quantity = ticker.ask_quantity;
                 state.event_time = state.event_time.max(ticker.event_time);
+                applied += 1;
             }
         }
-    } else if event.stream.contains("markPrice") {
+    } else if stream_name.contains("markprice") {
         let prices: Vec<MarkPrice> = if event.data.is_array() {
             serde_json::from_value(event.data)?
         } else {
@@ -246,10 +275,11 @@ fn apply_message(text: &str, universe: &Universe, store: &SymbolStore) -> Result
                 state.funding_rate = price.funding_rate;
                 state.next_funding_time = price.next_funding_time;
                 state.event_time = state.event_time.max(price.event_time);
+                applied += 1;
             }
         }
     }
-    Ok(())
+    Ok(applied)
 }
 
 fn is_safe_symbol(symbol: &str) -> bool {
@@ -302,5 +332,34 @@ mod tests {
         assert!(is_safe_symbol("1000PEPEUSDT"));
         assert!(!is_safe_symbol("BTC-USDT"));
         assert!(!is_safe_symbol("我来了USDT"));
+    }
+
+    #[test]
+    fn lowercase_combined_stream_names_update_symbol_state() {
+        let universe = Universe::new();
+        universe.symbols.insert(
+            "BTCUSDT".to_string(),
+            SymbolMeta {
+                tick_size: 0.1,
+                step_size: 0.001,
+                min_quantity: 0.001,
+            },
+        );
+        let store: SymbolStore = Arc::new(DashMap::new());
+        let message = r#"{
+            "stream":"!miniticker@arr",
+            "data":[{
+                "E":1000,
+                "s":"BTCUSDT",
+                "c":"65000.5",
+                "q":"25000000"
+            }]
+        }"#;
+
+        assert_eq!(apply_message(message, &universe, &store).unwrap(), 1);
+        let state = store.get("BTCUSDT").unwrap();
+        assert_eq!(state.last_price, 65_000.5);
+        assert_eq!(state.event_time, 1_000);
+        assert_eq!(state.samples.len(), 1);
     }
 }
