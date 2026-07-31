@@ -97,10 +97,15 @@ impl Universe {
                 next.push((symbol.symbol, meta));
             }
         }
-        self.symbols.clear();
+        if next.is_empty() {
+            anyhow::bail!("exchangeInfo kullanılabilir USD-M perpetual sembol döndürmedi");
+        }
+        let next_symbols: HashSet<String> = next.iter().map(|(symbol, _)| symbol.clone()).collect();
         for (symbol, meta) in next {
             self.symbols.insert(symbol, meta);
         }
+        self.symbols
+            .retain(|symbol, _| next_symbols.contains(symbol));
         Ok(())
     }
 }

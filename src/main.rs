@@ -107,10 +107,12 @@ async fn main() -> Result<()> {
     dashboard_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut last_entry_attempt: HashMap<String, i64> = HashMap::new();
     let mut funding_schedule: HashMap<String, (i64, f64)> = HashMap::new();
+    let shutdown_signal = shutdown_signal();
+    tokio::pin!(shutdown_signal);
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown_signal => {
                 shutdown_tx.send_replace(true);
                 database.checkpoint()?;
                 break;
@@ -290,6 +292,25 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("SIGTERM handler oluşturulamadı");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn build_dashboard(
