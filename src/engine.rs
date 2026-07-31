@@ -142,10 +142,8 @@ fn candidate_from(
     now: i64,
 ) -> Result<Candidate, CandidateReject> {
     let features = state.features;
-    if now.saturating_sub(state.price_received_at)
-        > config.price_stale_after.as_millis() as i64
-        || now.saturating_sub(state.book_received_at)
-            > config.book_stale_after.as_millis() as i64
+    if now.saturating_sub(state.price_received_at) > config.price_stale_after.as_millis() as i64
+        || now.saturating_sub(state.book_received_at) > config.book_stale_after.as_millis() as i64
         || state.last_price <= 0.0
         || state.bid <= 0.0
         || state.ask <= state.bid
