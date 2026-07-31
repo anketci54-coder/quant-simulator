@@ -310,8 +310,14 @@ impl PortfolioEngine {
         if self.snapshot.positions.len() >= self.limits.max_positions {
             return Err(EntryReject::Capacity);
         }
-        if self.snapshot.positions.iter().filter(|position| position.position.side == candidate.side).count()
-            >= self.limits.max_same_side_positions {
+        if self
+            .snapshot
+            .positions
+            .iter()
+            .filter(|position| position.position.side == candidate.side)
+            .count()
+            >= self.limits.max_same_side_positions
+        {
             return Err(EntryReject::SameSideCapacity);
         }
         if self
@@ -350,8 +356,8 @@ impl PortfolioEngine {
         if notional < meta.min_notional.max(self.limits.min_trade_notional) {
             return Err(EntryReject::NotionalTooSmall);
         }
-        let conservative_tp1_net = size.quantity * candidate.stop_distance * 0.40
-            - notional * expected_cost_rate;
+        let conservative_tp1_net =
+            size.quantity * candidate.stop_distance * 0.40 - notional * expected_cost_rate;
         if conservative_tp1_net < self.limits.min_expected_net_profit {
             return Err(EntryReject::ExpectedProfitTooSmall);
         }
@@ -359,7 +365,8 @@ impl PortfolioEngine {
             return Err(EntryReject::InsufficientFreeMargin);
         }
         if self.used_margin() + actual_margin
-            > self.account_equity() * self.limits.max_total_margin_fraction {
+            > self.account_equity() * self.limits.max_total_margin_fraction
+        {
             return Err(EntryReject::TotalMargin);
         }
         let risk_limit = self.account_equity() * self.limits.max_portfolio_risk;
