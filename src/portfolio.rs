@@ -31,11 +31,15 @@ pub struct EmergencyExitSummary {
 pub enum EntryReject {
     EntriesPaused,
     Capacity,
+    SameSideCapacity,
     DuplicateSymbol,
     InvalidQuote,
     InvalidSize,
     InsufficientFreeMargin,
     PortfolioRisk,
+    TotalMargin,
+    NotionalTooSmall,
+    ExpectedProfitTooSmall,
 }
 
 impl EntryReject {
@@ -43,11 +47,15 @@ impl EntryReject {
         match self {
             Self::EntriesPaused => "ENTRIES_PAUSED",
             Self::Capacity => "CAPACITY",
+            Self::SameSideCapacity => "SAME_SIDE_CAPACITY",
             Self::DuplicateSymbol => "DUPLICATE_SYMBOL",
             Self::InvalidQuote => "INVALID_QUOTE",
             Self::InvalidSize => "INVALID_SIZE",
             Self::InsufficientFreeMargin => "INSUFFICIENT_FREE_MARGIN",
             Self::PortfolioRisk => "PORTFOLIO_RISK",
+            Self::TotalMargin => "TOTAL_MARGIN",
+            Self::NotionalTooSmall => "NOTIONAL_TOO_SMALL",
+            Self::ExpectedProfitTooSmall => "EXPECTED_PROFIT_TOO_SMALL",
         }
     }
 }
@@ -55,10 +63,14 @@ impl EntryReject {
 #[derive(Clone, Debug)]
 pub struct PortfolioLimits {
     pub max_positions: usize,
+    pub max_same_side_positions: usize,
     pub leverage: f64,
     pub risk_per_trade: f64,
     pub max_portfolio_risk: f64,
     pub max_trade_allocation: f64,
+    pub max_total_margin_fraction: f64,
+    pub min_trade_notional: f64,
+    pub min_expected_net_profit: f64,
 }
 
 pub struct PortfolioEngine {
@@ -81,10 +93,15 @@ impl PortfolioEngine {
             || !policy.validate()
             || limits.max_positions == 0
             || limits.max_positions > 10
+            || limits.max_same_side_positions == 0
+            || limits.max_same_side_positions > limits.max_positions
             || !(1.0..=3.0).contains(&limits.leverage)
             || !(0.0..=0.02).contains(&limits.risk_per_trade)
             || !(0.0..=0.10).contains(&limits.max_portfolio_risk)
             || !(0.01..=0.10).contains(&limits.max_trade_allocation)
+            || !(0.05..=1.0).contains(&limits.max_total_margin_fraction)
+            || limits.min_trade_notional <= 0.0
+            || limits.min_expected_net_profit < 0.0
         {
             anyhow::bail!("PortfolioEngine yapılandırması geçersiz");
         }
@@ -293,6 +310,10 @@ impl PortfolioEngine {
         if self.snapshot.positions.len() >= self.limits.max_positions {
             return Err(EntryReject::Capacity);
         }
+        if self.snapshot.positions.iter().filter(|position| position.position.side == candidate.side).count()
+            >= self.limits.max_same_side_positions {
+            return Err(EntryReject::SameSideCapacity);
+        }
         if self
             .snapshot
             .positions
@@ -325,8 +346,21 @@ impl PortfolioEngine {
         )
         .ok_or(EntryReject::InvalidSize)?;
         let actual_margin = size.quantity * entry_fill / self.limits.leverage;
+        let notional = size.quantity * entry_fill;
+        if notional < meta.min_notional.max(self.limits.min_trade_notional) {
+            return Err(EntryReject::NotionalTooSmall);
+        }
+        let conservative_tp1_net = size.quantity * candidate.stop_distance * 0.40
+            - notional * expected_cost_rate;
+        if conservative_tp1_net < self.limits.min_expected_net_profit {
+            return Err(EntryReject::ExpectedProfitTooSmall);
+        }
         if actual_margin > self.free_margin() {
             return Err(EntryReject::InsufficientFreeMargin);
+        }
+        if self.used_margin() + actual_margin
+            > self.account_equity() * self.limits.max_total_margin_fraction {
+            return Err(EntryReject::TotalMargin);
         }
         let risk_limit = self.account_equity() * self.limits.max_portfolio_risk;
         if self
@@ -645,10 +679,14 @@ mod tests {
             PositionPolicy::default(),
             PortfolioLimits {
                 max_positions: 10,
+                max_same_side_positions: 3,
                 leverage: 3.0,
                 risk_per_trade: 0.005,
                 max_portfolio_risk: 0.02,
                 max_trade_allocation: 0.10,
+                max_total_margin_fraction: 0.40,
+                min_trade_notional: 100.0,
+                min_expected_net_profit: 1.0,
             },
         )
         .unwrap()
@@ -673,6 +711,7 @@ mod tests {
             tick_size: 0.01,
             step_size: 0.1,
             min_quantity: 0.1,
+            min_notional: 5.0,
         }
     }
 
