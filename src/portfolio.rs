@@ -79,6 +79,7 @@ pub struct PortfolioEngine {
     costs: CostModel,
     policy: PositionPolicy,
     limits: PortfolioLimits,
+    gate_rejection_cache: HashMap<String, (String, i64)>,
 }
 
 impl PortfolioEngine {
@@ -111,6 +112,7 @@ impl PortfolioEngine {
             costs,
             policy,
             limits,
+            gate_rejection_cache: HashMap::new(),
         })
     }
 
@@ -269,12 +271,26 @@ impl PortfolioEngine {
         Ok(result)
     }
 
-    pub fn record_gate_rejections(&self, rejections: &[GateRejection], now: i64) -> Result<()> {
+    pub fn record_gate_rejections(&mut self, rejections: &[GateRejection], now: i64) -> Result<()> {
         if rejections.is_empty() {
             return Ok(());
         }
         let decisions: Vec<SignalDecision> = rejections
             .iter()
+            .filter(|rejection| {
+                let reason = rejection.reason.as_str();
+                let should_record = self
+                    .gate_rejection_cache
+                    .get(&rejection.symbol)
+                    .is_none_or(|(previous_reason, previous_at)| {
+                        previous_reason != reason || now.saturating_sub(*previous_at) >= 900_000
+                    });
+                if should_record {
+                    self.gate_rejection_cache
+                        .insert(rejection.symbol.clone(), (reason.to_string(), now));
+                }
+                should_record
+            })
             .map(|rejection| SignalDecision {
                 decision_key: format!(
                     "GATE:{}:{}:{}",
@@ -293,6 +309,9 @@ impl PortfolioEngine {
                 observed_at: rejection.observed_at,
             })
             .collect();
+        if decisions.is_empty() {
+            return Ok(());
+        }
         self.store
             .persist_atomic(&self.snapshot, &[], &decisions, now)
             .context("Sinyal kapısı retleri atomik kaydedilemedi")
