@@ -221,6 +221,12 @@ impl SqliteStore {
             .context("state_snapshot yazılamadı")?;
 
         for event in ledger_events {
+            let position_id = sqlite_integer(event.position_id).with_context(|| {
+                format!(
+                    "ledger position_id SQLite sınırını aşıyor: {}",
+                    event.position_id
+                )
+            })?;
             transaction
                 .execute(
                     "
@@ -234,7 +240,7 @@ impl SqliteStore {
                     ",
                     params![
                         event.event_key,
-                        event.position_id,
+                        position_id,
                         event.symbol,
                         side_name(event.side),
                         stage_name(event.stage),
@@ -323,6 +329,10 @@ fn validate_snapshot(snapshot: &PortfolioSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn sqlite_integer(value: u64) -> Result<i64> {
+    i64::try_from(value).context("u64 değeri SQLite INTEGER alanına sığmıyor")
+}
+
 fn side_name(side: Side) -> &'static str {
     match side {
         Side::Long => "LONG",
@@ -376,5 +386,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn sqlite_ids_reject_unsigned_overflow() {
+        assert_eq!(sqlite_integer(i64::MAX as u64).unwrap(), i64::MAX);
+        assert!(sqlite_integer(u64::MAX).is_err());
     }
 }
