@@ -157,13 +157,14 @@ impl PortfolioEngine {
     ) -> Result<std::result::Result<u64, EntryReject>> {
         let before = self.snapshot.clone();
         let outcome = self.evaluate_open(candidate, meta, quote);
-        let decision = SignalDecision {
+        let mut decision = SignalDecision {
             decision_key: format!(
                 "{}:{}:{}",
                 candidate.symbol,
                 candidate.observed_at,
                 candidate.side.direction()
             ),
+            position_id: None,
             symbol: candidate.symbol.clone(),
             side: Some(candidate.side),
             score: candidate.score,
@@ -196,6 +197,7 @@ impl PortfolioEngine {
                 };
                 let id = self.snapshot.next_position_id;
                 self.snapshot.next_position_id = self.snapshot.next_position_id.saturating_add(1);
+                decision.position_id = Some(id);
                 let initial_margin = size.quantity * entry_fill / self.limits.leverage;
                 self.snapshot.positions.push(TrackedPosition {
                     id,
@@ -263,6 +265,7 @@ impl PortfolioEngine {
                     rejection.observed_at,
                     rejection.reason.as_str()
                 ),
+                position_id: None,
                 symbol: rejection.symbol.clone(),
                 side: None,
                 score: rejection.features.cheap_score,

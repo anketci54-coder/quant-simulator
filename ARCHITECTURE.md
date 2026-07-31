@@ -1,66 +1,75 @@
-
 # MTF_V4 Mass-Market Engine
 
-MTF_V4 replaces the monolithic REST polling loop with an event-driven pipeline.
-The production service contract remains `quant_bot`, while the internal engine
-is split into independently testable modules.
+MTF_V4 replaces the monolithic REST polling loop with an event-driven simulation
+pipeline. The binary remains `quant_bot`; the internal engine is split into
+independently testable modules.
 
-## Frozen V4 scope
+## Implemented signal scope
 
-V4 deliberately uses a small set of independent, measurable inputs:
+The first V4 version intentionally uses a small, measurable feature set:
 
-- return z-score over short and medium horizons;
-- volume impulse z-score;
-- spread and executable top-book liquidity;
-- realized volatility;
+- 15-second, 60-second and 300-second percentage returns;
+- quote-volume impulse;
+- executable best bid/ask spread and top-book liquidity;
+- realized short-window volatility;
 - top-book imbalance.
 
-ADX/EMA may be derived for display and regime grouping, but they do not receive
-extra votes when their information is already represented by normalized returns.
-Fibonacci, subjective order blocks and on-chain feeds are outside the first
-production scope. They can only be added after an out-of-sample ablation test
-shows that they improve net expectancy after fees and slippage.
+The features are normalized into a cheap ranking score. A symbol must also pass
+freshness, warm-up, volume, spread, direction and vote-consistency gates. LONG
+and SHORT are decided per symbol; BTC is not a global direction lock.
 
-## Pipeline
+ADX, EMA, Fibonacci, subjective order blocks, SMC labels and on-chain feeds are
+not part of the first V4 decision path. They should only be promoted after an
+out-of-sample ablation test improves net expectancy after costs.
 
-1. `UniverseManager` refreshes all tradeable USD-M perpetual contracts.
-2. `MarketStream` consumes all-market ticker and best-book WebSocket events.
-3. `SymbolStore` keeps one bounded, latest-state record per symbol.
-4. `FeatureEngine` updates cheap features for every symbol in constant time.
+## Runtime pipeline
+
+1. `UniverseManager` refreshes tradeable USD-M perpetual contracts without
+   exposing an empty universe during refresh.
+2. `MarketStream` consumes all-market mini-ticker, best-book and mark-price
+   WebSocket events with reconnect/backoff.
+3. `SymbolStore` keeps one bounded latest-state record per symbol.
+4. `FeatureEngine` updates cheap features for every tracked symbol once per
+   second.
 5. `Ranker` publishes a coalesced hot set; stale work never forms a FIFO queue.
-6. `ProbabilityModel` estimates a calibrated TP-before-SL probability.
-7. `RiskEngine` requires positive net expectancy and sizes from stop distance,
-   liquidity and confidence.
-8. `PositionEngine` owns the complete simulated position lifecycle.
-9. `PersistenceWriter` serializes SQLite writes without blocking market ingestion.
-10. `Panel` reads immutable snapshots and never locks the market-data hot path.
+6. `RiskEngine` requires valid liquidity, stop distance, free margin and
+   portfolio risk, then caps leverage at 3x and per-trade margin at 10%.
+7. `PositionEngine` owns cost-aware 40/40/20 exits, monotonic stops and the
+   open-ended runner.
+8. `PortfolioEngine` is the single owner of mutable account state.
+9. `SqliteStore` commits snapshots, executions and signal decisions atomically.
+10. `Panel` reads immutable dashboard snapshots and sends emergency commands to
+    the portfolio owner.
 
-## Removal rule
+Market ingestion does not take the SQLite mutex. SQLite writes are short,
+batched transactions performed by the portfolio actor; WAL and `FULL`
+synchronous mode protect restart recovery.
 
-The legacy blocking REST scanner is removed in the same commit that switches
-`main.rs` to MTF_V4. MTF_V4 must pass format, check, Clippy, unit tests, replay
-tests and a WebSocket soak test before that commit can merge.
+## Cost and accounting model
 
-## Data policy
+Entry and exit fills include configured slippage. Net PnL includes allocated
+entry fees, exit fees and funding. Break-even and stop locks therefore protect
+cost-adjusted rather than raw price PnL. Margin is reserved from equity without
+being treated as a realized expense.
 
-All symbols are observed continuously. Expensive depth and structural analysis
-is applied only to the current hot set. The hot set is coalesced: a symbol has
-at most one pending analysis record and newer state replaces older state.
+## Learning data
 
-## Probability and learning
+The database records:
 
-Every hot candidate, including rejected candidates, is persisted with its
-feature snapshot. Outcomes are labeled at fixed horizons with maximum favorable
-and adverse excursion.
+- gate-rejection transitions with their feature snapshot;
+- portfolio-level accept/reject decisions;
+- accepted decisions linked directly to `position_id`;
+- every open, stop movement, partial exit, funding accrual and final close.
 
-The first model is a Beta-Binomial estimator grouped by regime and score band:
+This is training-ready raw evidence, not an online self-modifying model.
+`stats.rs` contains conservative expectancy helpers, but V4 does not
+automatically change production parameters. A future challenger must use
+minimum samples, walk-forward/out-of-sample validation and cost-adjusted
+expectancy before promotion.
 
-`p = (wins + alpha) / (samples + alpha + beta)`
+## Deployment rule
 
-An entry is allowed only when:
-
-`EV = p * average_win - (1 - p) * average_loss - costs > 0`
-
-A single losing trade is not considered a learned mistake. Parameter promotion
-requires a minimum sample, walk-forward validation and a challenger that beats
-the active model after costs. Failed challengers are discarded automatically.
+The V3 service is not upgraded while it owns open V3 positions. V4 first runs
+beside V3 with a separate database and port. After restart, emergency-exit and
+soak validation, V3 entries are stopped, its positions drain, and only then is
+the service switched to V4 with a fresh 10,000 USDT simulation balance.

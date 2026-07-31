@@ -13,7 +13,7 @@ use crate::{
     position::{ExitReason, Position, PositionStage},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TrackedPosition {
@@ -74,6 +74,7 @@ pub struct LedgerEvent {
 #[derive(Clone, Debug)]
 pub struct SignalDecision {
     pub decision_key: String,
+    pub position_id: Option<u64>,
     pub symbol: String,
     pub side: Option<Side>,
     pub score: f64,
@@ -137,6 +138,7 @@ impl SqliteStore {
                 CREATE TABLE IF NOT EXISTS signal_decisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     decision_key TEXT NOT NULL UNIQUE,
+                    position_id INTEGER,
                     symbol TEXT NOT NULL,
                     side TEXT,
                     score REAL NOT NULL,
@@ -151,6 +153,8 @@ impl SqliteStore {
                     ON signal_decisions(accepted, reject_reason, observed_at);
                 CREATE INDEX IF NOT EXISTS idx_signal_side
                     ON signal_decisions(side, accepted, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_signal_position
+                    ON signal_decisions(position_id);
                 ",
             )
             .context("SQLite şeması hazırlanamadı")?;
@@ -261,16 +265,27 @@ impl SqliteStore {
         for decision in signal_decisions {
             let features_json =
                 serde_json::to_string(&decision.features).context("feature JSON üretilemedi")?;
+            let position_id = decision
+                .position_id
+                .map(sqlite_integer)
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "signal position_id SQLite sınırını aşıyor: {:?}",
+                        decision.position_id
+                    )
+                })?;
             transaction
                 .execute(
                     "
                     INSERT OR IGNORE INTO signal_decisions (
-                        decision_key, symbol, side, score, confidence, accepted,
-                        reject_reason, features_json, observed_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                        decision_key, position_id, symbol, side, score, confidence,
+                        accepted, reject_reason, features_json, observed_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                     ",
                     params![
                         decision.decision_key,
+                        position_id,
                         decision.symbol,
                         decision.side.map(side_name),
                         decision.score,
