@@ -79,7 +79,7 @@ pub struct PortfolioEngine {
     costs: CostModel,
     policy: PositionPolicy,
     limits: PortfolioLimits,
-    gate_rejection_cache: HashMap<String, (String, i64)>,
+    gate_rejection_cache: HashMap<(String, String), i64>,
 }
 
 impl PortfolioEngine {
@@ -279,14 +279,13 @@ impl PortfolioEngine {
             .iter()
             .filter(|rejection| {
                 let reason = rejection.reason.as_str();
-                let should_record = self.gate_rejection_cache.get(&rejection.symbol).is_none_or(
-                    |(previous_reason, previous_at)| {
-                        previous_reason != reason || now.saturating_sub(*previous_at) >= 900_000
-                    },
-                );
+                let cache_key = (rejection.symbol.clone(), reason.to_string());
+                let should_record = self
+                    .gate_rejection_cache
+                    .get(&cache_key)
+                    .is_none_or(|previous_at| now.saturating_sub(*previous_at) >= 3_600_000);
                 if should_record {
-                    self.gate_rejection_cache
-                        .insert(rejection.symbol.clone(), (reason.to_string(), now));
+                    self.gate_rejection_cache.insert(cache_key, now);
                 }
                 should_record
             })
