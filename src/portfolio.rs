@@ -380,11 +380,9 @@ impl PortfolioEngine {
         // fees/slippage. This matches the actual 40/40/20 policy instead of
         // incorrectly judging the whole trade only by its TP1 slice.
         let lifecycle_reward_r = 0.40 * 1.0 + 0.40 * 2.0 + 0.20 * 3.0;
-        let expected_net_profit = size.quantity
-            * candidate.stop_distance
-            * lifecycle_reward_r
-            * candidate.confidence
-            - notional * expected_cost_rate;
+        let expected_net_profit =
+            size.quantity * candidate.stop_distance * lifecycle_reward_r * candidate.confidence
+                - notional * expected_cost_rate;
         if expected_net_profit < self.limits.min_expected_net_profit {
             return Err(EntryReject::ExpectedProfitTooSmall);
         }
