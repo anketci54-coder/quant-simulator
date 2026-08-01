@@ -457,4 +457,3 @@ fn build_dashboard(
         positions,
     }
 }
-
