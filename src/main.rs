@@ -15,7 +15,7 @@ use quant_bot::{
     model::Side,
     panel::{run_panel, DashboardSnapshot, EmergencyCommand, PositionView},
     portfolio::{PortfolioEngine, PortfolioLimits, Quote},
-    position::{PositionEvent, PositionPolicy, PositionStage},
+    position::{ExitReason, PositionEvent, PositionPolicy, PositionStage},
     storage::SqliteStore,
 };
 use tokio::{
@@ -55,10 +55,10 @@ async fn main() -> Result<()> {
     universe_ready_rx.wait_for(|ready| *ready).await?;
 
     let database =
-        Arc::new(SqliteStore::open(&config.database_path).context("MTF_V4 SQLite başlatılamadı")?);
+        Arc::new(SqliteStore::open(&config.database_path).context("MTF_V4 SQLite baÅŸlatÄ±lamadÄ±")?);
     let portfolio_snapshot = database
         .load_or_create(config.initial_balance, now_millis())
-        .context("MTF_V4 AppState geri yüklenemedi")?;
+        .context("MTF_V4 AppState geri yÃ¼klenemedi")?;
     let mut portfolio = PortfolioEngine::new(
         portfolio_snapshot,
         database.clone(),
@@ -165,12 +165,23 @@ async fn main() -> Result<()> {
                     let events = portfolio
                         .process_quote(&symbol, quote, meta.step_size, now)
                         .with_context(|| {
-                            format!("{symbol} pozisyon güncellemesi başarısız")
+                            format!("{symbol} pozisyon gÃ¼ncellemesi baÅŸarÄ±sÄ±z")
                         })?;
-                    if events.iter().any(|event| matches!(event, PositionEvent::Closed { .. })) {
+                    if let Some(reason) = events.iter().find_map(|event| match event {
+                        PositionEvent::Closed { reason, .. } => Some(*reason),
+                        _ => None,
+                    }) {
+                        let cooldown = if matches!(
+                            reason,
+                            ExitReason::InitialStop | ExitReason::PreTp1Ratchet
+                        ) {
+                            Duration::from_secs(3_600)
+                        } else {
+                            config.symbol_cooldown
+                        };
                         symbol_cooldown_until.insert(
                             symbol.clone(),
-                            now.saturating_add(config.symbol_cooldown.as_millis() as i64),
+                            now.saturating_add(cooldown.as_millis() as i64),
                         );
                     }
 
@@ -190,7 +201,7 @@ async fn main() -> Result<()> {
                                         now,
                                     )
                                     .with_context(|| {
-                                        format!("{symbol} funding kaydı başarısız")
+                                        format!("{symbol} funding kaydÄ± baÅŸarÄ±sÄ±z")
                                     })?;
                             }
                             _ => {}
@@ -259,7 +270,7 @@ async fn main() -> Result<()> {
                 let now = now_millis();
                 portfolio
                     .record_gate_rejections(&frame.gate_rejections, now)
-                    .context("Sinyal ret geçişleri kaydedilemedi")?;
+                    .context("Sinyal ret geÃ§iÅŸleri kaydedilemedi")?;
                 if now.saturating_sub(last_hot_log) >= 60_000 {
                     last_hot_log = now;
                     if let Some(best) = frame.candidates.first() {
@@ -316,7 +327,7 @@ async fn main() -> Result<()> {
                         let result = portfolio
                             .try_open(candidate, &meta, quote, regime, now)
                             .with_context(|| {
-                                format!("{} giriş kararı kaydedilemedi", candidate.symbol)
+                                format!("{} giriÅŸ kararÄ± kaydedilemedi", candidate.symbol)
                             })?;
                         if let Ok(position_id) = result {
                             recent_entries.push_back(now);
@@ -349,7 +360,7 @@ async fn shutdown_signal() {
         use tokio::signal::unix::{signal, SignalKind};
 
         let mut terminate =
-            signal(SignalKind::terminate()).expect("SIGTERM handler oluşturulamadı");
+            signal(SignalKind::terminate()).expect("SIGTERM handler oluÅŸturulamadÄ±");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
@@ -394,8 +405,8 @@ fn build_dashboard(
             .unwrap_or((tracked.position.entry_fill, 0.0));
         unrealized_net_pnl += open_pnl;
         let stage = match tracked.position.stage {
-            PositionStage::BeforeTp1 => "TP1 BEKLİYOR",
-            PositionStage::AfterTp1 => "TP1 GERÇEKLEŞTİ",
+            PositionStage::BeforeTp1 => "TP1 BEKLÄ°YOR",
+            PositionStage::AfterTp1 => "TP1 GERÃ‡EKLEÅTÄ°",
             PositionStage::Runner => "RUNNER",
             PositionStage::Closed => "KAPALI",
         };
@@ -424,15 +435,15 @@ fn build_dashboard(
     DashboardSnapshot {
         strategy_version: quant_bot::model::STRATEGY_VERSION.to_string(),
         status: if !runtime_entry_enabled {
-            "ENTRY_ENABLED=false: yeni girişler durduruldu".to_string()
+            "ENTRY_ENABLED=false: yeni giriÅŸler durduruldu".to_string()
         } else if entries_paused {
             portfolio
                 .snapshot()
                 .pause_reason
                 .clone()
-                .unwrap_or_else(|| "Yeni girişler durduruldu".to_string())
+                .unwrap_or_else(|| "Yeni giriÅŸler durduruldu".to_string())
         } else {
-            "Tüm USD-M Futures pariteleri eşzamanlı taranıyor".to_string()
+            "TÃ¼m USD-M Futures pariteleri eÅŸzamanlÄ± taranÄ±yor".to_string()
         },
         entries_paused,
         balance: portfolio.snapshot().balance + unrealized_net_pnl,
@@ -445,3 +456,4 @@ fn build_dashboard(
         positions,
     }
 }
+
