@@ -29,6 +29,7 @@ pub struct DashboardSnapshot {
     pub tracked_symbols: usize,
     pub updated_at: i64,
     pub positions: Vec<PositionView>,
+    pub closed_trades: Vec<ClosedTradeView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -50,6 +51,22 @@ pub struct PositionView {
     pub unrealized_net_pnl: f64,
     pub funding_cost: f64,
     pub opened_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ClosedTradeView {
+    pub position_id: u64,
+    pub symbol: String,
+    pub side: String,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub exit_reason: String,
+    pub tp_stage: String,
+    pub net_pnl: f64,
+    pub fees: f64,
+    pub funding: f64,
+    pub opened_at: i64,
+    pub closed_at: i64,
 }
 
 pub struct EmergencyCommand {
@@ -81,7 +98,7 @@ pub async fn run_panel(
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .with_context(|| format!("Panel {bind} adresine baÄŸlanamadÄ±"))?;
+        .with_context(|| format!("Panel {bind} adresine bağlanamadı"))?;
     println!("MTF_HYBRID panel listening on {bind}");
     axum::serve(listener, app)
         .await
@@ -98,7 +115,7 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if !constant_time_eq(supplied.as_bytes(), state.action_token.as_bytes()) {
-        return (StatusCode::FORBIDDEN, "GeÃ§ersiz iÅŸlem anahtarÄ±").into_response();
+        return (StatusCode::FORBIDDEN, "Geçersiz işlem anahtarı").into_response();
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
@@ -109,7 +126,7 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "PortfÃ¶y motoruna ulaÅŸÄ±lamadÄ±",
+            "Portföy motoruna ulaşılamadı",
         )
             .into_response();
     }
@@ -124,7 +141,7 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
         Ok(Err(error)) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Acil Ã§Ä±kÄ±ÅŸ yanÄ±tÄ± alÄ±namadÄ±",
+            "Acil çıkış yanıtı alınamadı",
         )
             .into_response(),
     }
@@ -156,7 +173,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Quant Futures Â· __STRATEGY_VERSION__</title>
+<title>Quant Futures · __STRATEGY_VERSION__</title>
 <style>
 :root{color-scheme:dark;--bg:#05080d;--panel:#0e1623;--panel2:#101c2c;--line:#213149;--muted:#8291a8;--text:#f6f8fc;--gold:#f5c542;--green:#26d99a;--red:#ff5277;--blue:#4c8dff}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% -10%,#10213b 0,transparent 34%),radial-gradient(circle at 95% 0,#2b2210 0,transparent 25%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
@@ -164,29 +181,33 @@ const PANEL_HTML: &str = r#"<!doctype html>
 .topbar{border-radius:20px;padding:16px 18px;display:flex;align-items:center;gap:14px}.logo{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;background:linear-gradient(145deg,#ffe069,#e7a900);color:#090b0f;font-weight:1000;font-size:21px;box-shadow:0 8px 22px #f5c54233}.brand h1{margin:0;font-size:20px}.brand p{margin:4px 0 0;color:var(--muted);font-size:12px}.spacer{flex:1}.badge{padding:8px 12px;border-radius:10px;background:#f5c542;color:#161204;font-size:11px;font-weight:900;letter-spacing:.08em}.status{color:#b6c2d5;padding:10px 13px;border:1px solid var(--line);border-radius:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 13px var(--green);margin-right:8px}
 .panic{border:1px solid #ff527788;background:linear-gradient(145deg,#441426,#230914);color:#fff;border-radius:12px;padding:11px 15px;font-weight:900;cursor:pointer;box-shadow:0 8px 20px #ff527722}.panic:hover{transform:translateY(-1px);filter:brightness(1.12)}.panic:disabled{opacity:.55;cursor:wait}
 .metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:18px 0 26px}.metric{border-radius:16px;padding:16px;min-height:92px}.label{color:var(--muted);font-size:10px;letter-spacing:.11em;text-transform:uppercase}.value{font-size:21px;font-weight:850;margin-top:12px}.positive{color:var(--green)}.negative{color:var(--red)}
-.section-head{display:flex;align-items:end;margin:0 2px 12px}.section-head h2{font-size:16px;margin:0}.section-head small{margin-left:auto;color:var(--muted)}.positions{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.position{position:relative;border-radius:20px;padding:18px;overflow:hidden;min-height:260px}.position.long{border-color:#26d99a55}.position.short{border-color:#ff527755}.position:after{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;background:var(--side)}.position.long{--side:var(--green)}.position.short{--side:var(--red)}.phead{display:flex;gap:10px;align-items:start}.symbol{font-size:22px;font-weight:950}.meta{color:var(--muted);font-size:12px;margin-top:5px}.side{margin-left:auto;border:1px solid var(--side);color:var(--side);border-radius:9px;padding:7px 10px;font-weight:900}.pnl{text-align:right;font-size:22px;font-weight:900;color:var(--text);min-width:110px}.pnl.positive,.realized-pnl.positive{color:var(--green)}.pnl.negative,.realized-pnl.negative{color:var(--red)}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:14px 0;margin:17px 0}.cell{background:#080e17;border:1px solid #162237;border-radius:10px;padding:10px}.cell b{display:block;margin-top:7px}.levels{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;color:var(--muted);font-size:11px}.levels b{display:block;color:var(--text);margin-top:4px}.empty{border-radius:18px;min-height:180px;display:grid;place-items:center;color:var(--muted);grid-column:1/-1}.footer{text-align:center;color:#526079;font-size:10px;margin-top:26px}
+.section-head{display:flex;align-items:end;margin:0 2px 12px}.section-head h2{font-size:16px;margin:0}.section-head small{margin-left:auto;color:var(--muted)}.positions{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.position{position:relative;border-radius:20px;padding:18px;overflow:hidden;min-height:260px}.position.long{border-color:#26d99a55}.position.short{border-color:#ff527755}.position:after{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;background:var(--side)}.position.long{--side:var(--green)}.position.short{--side:var(--red)}.phead{display:flex;gap:10px;align-items:start}.symbol{font-size:22px;font-weight:950}.meta{color:var(--muted);font-size:12px;margin-top:5px}.side{margin-left:auto;border:1px solid var(--side);color:var(--side);border-radius:9px;padding:7px 10px;font-weight:900}.pnl{text-align:right;font-size:22px;font-weight:900;color:var(--text);min-width:110px}.pnl.positive,.realized-pnl.positive{color:var(--green)}.pnl.negative,.realized-pnl.negative{color:var(--red)}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:14px 0;margin:17px 0}.cell{background:#080e17;border:1px solid #162237;border-radius:10px;padding:10px}.cell b{display:block;margin-top:7px}.levels{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;color:var(--muted);font-size:11px}.levels b{display:block;color:var(--text);margin-top:4px}.empty{border-radius:18px;min-height:180px;display:grid;place-items:center;color:var(--muted);grid-column:1/-1}.history-wrap{margin-top:30px}.history{border-radius:18px;overflow:auto}.history table{width:100%;border-collapse:collapse;min-width:1050px}.history th,.history td{padding:13px 14px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}.history th{color:var(--muted);font-size:10px;letter-spacing:.09em;text-transform:uppercase;background:#0b1320}.history tbody tr:hover{background:#15203588}.history .empty-row{text-align:center;color:var(--muted);padding:28px}.direction{font-weight:900}.direction.long{color:var(--green)}.direction.short{color:var(--red)}.reason{color:#c3cee0}.footer{text-align:center;color:#526079;font-size:10px;margin-top:26px}
 @media(max-width:1150px){.metrics{grid-template-columns:repeat(3,1fr)}.positions{grid-template-columns:repeat(2,1fr)}}@media(max-width:720px){.shell{padding:12px}.topbar{flex-wrap:wrap}.spacer{display:none}.status{order:4;width:100%}.metrics{grid-template-columns:repeat(2,1fr)}.positions{grid-template-columns:1fr}.panic{margin-left:auto}.badge{display:none}}
 </style>
 </head>
 <body>
 <main class="shell">
   <header class="topbar">
-    <div class="logo">Q</div><div class="brand"><h1>Quant Hybrid</h1><p>V3 sinyal Â· V4 risk ve yÃ¼rÃ¼tme simÃ¼lasyonu</p></div>
-    <div class="spacer"></div><span class="badge">SÄ°MÃœLASYON</span>
-    <div class="status"><span class="dot"></span><span id="status">Motor baÅŸlatÄ±lÄ±yor</span></div>
-    <button class="panic" id="panic">ACÄ°L Ã‡IKIÅ Â· TÃœMÃœNÃœ KAPAT</button>
+    <div class="logo">Q</div><div class="brand"><h1>Quant Hybrid</h1><p>V3 sinyal · V4 risk ve yürütme simülasyonu</p></div>
+    <div class="spacer"></div><span class="badge">SİMÜLASYON</span>
+    <div class="status"><span class="dot"></span><span id="status">Motor başlatılıyor</span></div>
+    <button class="panic" id="panic">ACİL ÇIKIŞ · TÜMÜNÜ KAPAT</button>
   </header>
   <section class="metrics">
-    <div class="metric"><div class="label">Toplam Bakiye</div><div class="value" id="balance">â€”</div></div>
-    <div class="metric"><div class="label">GerÃ§ekleÅŸen Net K/Z</div><div class="value" id="realized">â€”</div></div>
-    <div class="metric"><div class="label">AÃ§Ä±k Net K/Z</div><div class="value" id="unrealized">â€”</div></div>
-    <div class="metric"><div class="label">KullanÄ±lan Marjin</div><div class="value" id="used">â€”</div></div>
-    <div class="metric"><div class="label">Serbest Marjin</div><div class="value" id="free">â€”</div></div>
-    <div class="metric"><div class="label">Takip Edilen Piyasa</div><div class="value" id="tracked">â€”</div></div>
+    <div class="metric"><div class="label">Toplam Bakiye</div><div class="value" id="balance">—</div></div>
+    <div class="metric"><div class="label">Gerçekleşen Net K/Z</div><div class="value" id="realized">—</div></div>
+    <div class="metric"><div class="label">Açık Net K/Z</div><div class="value" id="unrealized">—</div></div>
+    <div class="metric"><div class="label">Kullanılan Marjin</div><div class="value" id="used">—</div></div>
+    <div class="metric"><div class="label">Serbest Marjin</div><div class="value" id="free">—</div></div>
+    <div class="metric"><div class="label">Takip Edilen Piyasa</div><div class="value" id="tracked">—</div></div>
   </section>
-  <div class="section-head"><h2>AÃ§Ä±k Pozisyonlar</h2><small id="summary">â€”</small></div>
-  <section class="positions" id="positions"><div class="empty">Piyasa verisi bekleniyorâ€¦</div></section>
-  <div class="footer">Komisyon, slippage ve fonlama net PnL iÃ§indedir Â· Son bacak sabit TP olmadan trendi izler.</div>
+  <div class="section-head"><h2>Açık Pozisyonlar</h2><small id="summary">—</small></div>
+  <section class="positions" id="positions"><div class="empty">Piyasa verisi bekleniyor…</div></section>
+  <section class="history-wrap">
+    <div class="section-head"><h2>Kapanan İşlemler</h2><small id="history-summary">—</small></div>
+    <div class="history"><table><thead><tr><th>ID</th><th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>TP Aşaması</th><th>Kapanış Nedeni</th><th>Net K/Z</th><th>Komisyon</th><th>Fonlama</th><th>Süre</th><th>Kapanış</th></tr></thead><tbody id="history-body"><tr><td class="empty-row" colspan="12">Henüz kapanan işlem yok.</td></tr></tbody></table></div>
+  </section>
+  <div class="footer">Komisyon, slippage ve fonlama net PnL içindedir · Son bacak sabit TP olmadan trendi izler.</div>
 </main>
 <script>
 const ACTION_TOKEN=__ACTION_TOKEN__;
@@ -199,27 +220,37 @@ const cash=v=>`${money.format(clean(v))} USDT`;
 const signedCash=v=>`${clean(v)>0?'+':''}${cash(v)}`;
 const tone=(el,v)=>{el.classList.toggle('positive',v>0);el.classList.toggle('negative',v<0)};
 function setMoney(id,v,signed=false){const e=document.getElementById(id);e.textContent=signed?signedCash(v):cash(v);tone(e,v)}
+const reasonLabel=v=>({INITIAL_STOP:'Başlangıç stopu',PRE_TP1_RATCHET:'TP1 öncesi hareketli stop',TP1_STOP:'TP1 sonrası stop',RUNNER_TRAIL:'Trend takip stopu',TREND_INVALIDATION:'Trend geçersizleşti',FUNDING_EXIT:'Fonlama maliyeti çıkışı',EMERGENCY_EXIT:'Acil çıkış'})[v]||v||'Bilinmiyor';
+const duration=(a,b)=>{const m=Math.max(0,Math.round((b-a)/60000));if(m<60)return m+' dk';const h=Math.floor(m/60),r=m%60;return h+' sa '+r+' dk'};
+const closedAt=v=>new Intl.DateTimeFormat('tr-TR',{dateStyle:'short',timeStyle:'medium'}).format(new Date(v));
+function renderHistory(items){
+ const body=document.getElementById('history-body');body.replaceChildren();
+ document.getElementById('history-summary').textContent=items.length?'Son '+items.length+' kapanan işlem':'Kayıt yok';
+ if(!items.length){const row=document.createElement('tr');row.innerHTML='<td class="empty-row" colspan="12">Henüz kapanan işlem yok.</td>';body.append(row);return}
+ for(const t of items){const row=document.createElement('tr');const sideClass=t.side==='LONG'?'long':'short';row.innerHTML=`<td>#${t.position_id}</td><td><b>${t.symbol}</b></td><td class="direction ${sideClass}">${t.side}</td><td>${price(t.entry_price)}</td><td>${price(t.exit_price)}</td><td>${t.tp_stage}</td><td class="reason">${reasonLabel(t.exit_reason)}</td><td class="trade-pnl">${signedCash(t.net_pnl)}</td><td>${cash(t.fees)}</td><td>${cash(t.funding)}</td><td>${duration(t.opened_at,t.closed_at)}</td><td>${closedAt(t.closed_at)}</td>`;tone(row.querySelector('.trade-pnl'),t.net_pnl);body.append(row)}
+}
 function render(d){
  document.getElementById('status').textContent=d.status;
  document.querySelector('.dot').style.background=d.entries_paused?'#ff5277':'#26d99a';
  setMoney('balance',d.balance);setMoney('realized',d.realized_net_pnl,true);setMoney('unrealized',d.unrealized_net_pnl,true);
  document.getElementById('used').textContent=cash(d.used_margin);document.getElementById('free').textContent=cash(d.free_margin);
  document.getElementById('tracked').textContent=count.format(d.tracked_symbols);
- document.getElementById('summary').textContent=`${d.positions.length} pozisyon Â· ${d.strategy_version}`;
+ document.getElementById('summary').textContent=`${d.positions.length} pozisyon · ${d.strategy_version}`;
  const root=document.getElementById('positions');root.replaceChildren();
- if(!d.positions.length){const e=document.createElement('div');e.className='empty';e.textContent='HenÃ¼z aÃ§Ä±k pozisyon yok.';root.append(e);return}
+ if(!d.positions.length){const e=document.createElement('div');e.className='empty';e.textContent='Henüz açık pozisyon yok.';root.append(e)}
  for(const p of d.positions){
   const card=document.createElement('article');card.className=`position ${p.side==='LONG'?'long':'short'}`;
   const total=p.realized_net_pnl+p.unrealized_net_pnl;
   card.innerHTML=`<div class="phead"><div><div class="symbol"></div><div class="meta"></div></div><span class="side"></span><div class="pnl"></div></div>
-  <div class="grid3"><div class="cell"><span class="label">GiriÅŸ</span><b>${price(p.entry)}</b></div><div class="cell"><span class="label">AnlÄ±k</span><b>${price(p.current)}</b></div><div class="cell"><span class="label">Kalan Miktar</span><b>${qty.format(p.remaining_quantity)}</b></div></div>
-  <div class="levels"><span>Stop<b>${price(p.stop)}</b></span><span>TP1 Â· %40<b>${price(p.tp1)}</b></span><span>TP2 Â· %40<b>${price(p.tp2)}</b></span><span>Kalan Marjin<b>${cash(p.remaining_margin)}</b></span><span>GerÃ§ekleÅŸen<b class="realized-pnl">${signedCash(p.realized_net_pnl)}</b></span><span>Fonlama<b>${cash(p.funding_cost)}</b></span></div>`;
-  card.querySelector('.symbol').textContent=p.symbol;card.querySelector('.meta').textContent=`#${p.id} Â· ${p.leverage}x Â· ${p.stage} Â· runner %20`;
+  <div class="grid3"><div class="cell"><span class="label">Giriş</span><b>${price(p.entry)}</b></div><div class="cell"><span class="label">Anlık</span><b>${price(p.current)}</b></div><div class="cell"><span class="label">Kalan Miktar</span><b>${qty.format(p.remaining_quantity)}</b></div></div>
+  <div class="levels"><span>Stop<b>${price(p.stop)}</b></span><span>TP1 · %40<b>${price(p.tp1)}</b></span><span>TP2 · %40<b>${price(p.tp2)}</b></span><span>Kalan Marjin<b>${cash(p.remaining_margin)}</b></span><span>Gerçekleşen<b class="realized-pnl">${signedCash(p.realized_net_pnl)}</b></span><span>Fonlama<b>${cash(p.funding_cost)}</b></span></div>`;
+  card.querySelector('.symbol').textContent=p.symbol;card.querySelector('.meta').textContent=`#${p.id} · ${p.leverage}x · ${p.stage} · runner %20`;
   card.querySelector('.side').textContent=p.side;const pnl=card.querySelector('.pnl');pnl.textContent=signedCash(total);tone(pnl,total);tone(card.querySelector('.realized-pnl'),p.realized_net_pnl);root.append(card);
  }
+ renderHistory(d.closed_trades||[]);
 }
 async function refresh(){try{const r=await fetch('/api/dashboard',{cache:'no-store'});if(r.ok)render(await r.json())}catch{}}
-document.getElementById('panic').onclick=async function(){this.disabled=true;this.textContent='KAPATILIYORâ€¦';try{const r=await fetch('/api/emergency-exit',{method:'POST',headers:{'x-action-token':ACTION_TOKEN}});const x=await r.json();if(!r.ok)throw new Error(x);this.textContent=`KAPATILDI Â· ${x.closed_positions} POZÄ°SYON`;await refresh()}catch(e){this.disabled=false;this.textContent='HATA Â· TEKRAR DENE'}};
+document.getElementById('panic').onclick=async function(){this.disabled=true;this.textContent='KAPATILIYOR…';try{const r=await fetch('/api/emergency-exit',{method:'POST',headers:{'x-action-token':ACTION_TOKEN}});const x=await r.json();if(!r.ok)throw new Error(x);this.textContent=`KAPATILDI · ${x.closed_positions} POZİSYON`;await refresh()}catch(e){this.disabled=false;this.textContent='HATA · TEKRAR DENE'}};
 refresh();setInterval(refresh,1000);
 </script>
 </body>
