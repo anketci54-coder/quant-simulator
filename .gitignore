@@ -1,6 +1,6 @@
+/target/
 .env
-target/
-output.log
-quant_history.db
-quant_history.db-shm
-quant_history.db-wal
+*.db
+*.db-shm
+*.db-wal
+trade_analytics.jsonl
