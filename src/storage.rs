@@ -371,9 +371,8 @@ impl SqliteStore {
             .query_map(params![limit], |row| {
                 let position_id = row.get::<_, i64>(0)?;
                 Ok(ClosedTradeRecord {
-                    position_id: u64::try_from(position_id).map_err(|_| {
-                        rusqlite::Error::IntegralValueOutOfRange(0, position_id)
-                    })?,
+                    position_id: u64::try_from(position_id)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, position_id))?,
                     symbol: row.get(1)?,
                     side: row.get(2)?,
                     entry_price: row.get(3)?,
