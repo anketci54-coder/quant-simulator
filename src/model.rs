@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-pub const STRATEGY_VERSION: &str = "MTF_V4";
+pub const STRATEGY_VERSION: &str = "MTF_HYBRID";
 pub const MAX_SAMPLES: usize = 1_800;
 
 #[derive(Clone, Debug, Default)]
@@ -83,6 +83,7 @@ pub struct Candidate {
     pub stop_distance: f64,
     pub liquidity_notional: f64,
     pub observed_at: i64,
+    pub market_regime: String,
     pub features: FeatureSnapshot,
 }
 
