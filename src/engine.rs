@@ -37,6 +37,7 @@ pub enum CandidateReject {
     WeakScore,
     NeutralDirection,
     ConflictingSignals,
+    Unconfirmed,
 }
 
 impl CandidateReject {
@@ -49,6 +50,7 @@ impl CandidateReject {
             Self::WeakScore => "WEAK_SCORE",
             Self::NeutralDirection => "NEUTRAL_DIRECTION",
             Self::ConflictingSignals => "CONFLICTING_SIGNALS",
+            Self::Unconfirmed => "UNCONFIRMED",
         }
     }
 }
@@ -62,6 +64,7 @@ pub async fn run_feature_engine(
     let mut interval = time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut last_rejections: HashMap<String, CandidateReject> = HashMap::new();
+    let mut confirmations: HashMap<String, (Side, u8)> = HashMap::new();
     loop {
         tokio::select! {
             changed = shutdown.changed() => {
@@ -78,11 +81,33 @@ pub async fn run_feature_engine(
                     entry.features = features;
                     match candidate_from(&config, &entry, now) {
                         Ok(candidate) => {
+                            let confirmation = confirmations
+                                .entry(candidate.symbol.clone())
+                                .or_insert((candidate.side, 0));
+                            if confirmation.0 == candidate.side {
+                                confirmation.1 = confirmation.1.saturating_add(1).min(3);
+                            } else {
+                                *confirmation = (candidate.side, 1);
+                            }
+                            if confirmation.1 < 3 {
+                                let symbol = candidate.symbol.clone();
+                                let reason = CandidateReject::Unconfirmed;
+                                if last_rejections.insert(symbol.clone(), reason) != Some(reason) {
+                                    gate_rejections.push(GateRejection {
+                                        symbol,
+                                        reason,
+                                        features,
+                                        observed_at: now,
+                                    });
+                                }
+                                continue;
+                            }
                             last_rejections.remove(&candidate.symbol);
                             candidates.push(candidate);
                         }
                         Err(reason) => {
                             let symbol = entry.symbol.clone();
+                            confirmations.remove(&symbol);
                             if last_rejections.insert(symbol.clone(), reason) != Some(reason) {
                                 gate_rejections.push(GateRejection {
                                     symbol,
@@ -150,11 +175,11 @@ fn candidate_from(
     {
         return Err(CandidateReject::Stale);
     }
-    let window_ready = state.samples.len() >= 30
+    let window_ready = state.samples.len() >= 120
         && state
             .samples
             .front()
-            .is_some_and(|sample| sample.event_time <= now - 30_000);
+            .is_some_and(|sample| sample.event_time <= now - 300_000);
     if !window_ready {
         return Err(CandidateReject::Warmup);
     }
@@ -167,8 +192,10 @@ fn candidate_from(
     if features.cheap_score < 55.0 {
         return Err(CandidateReject::WeakScore);
     }
-    let direction =
-        features.return_15s * 0.5 + features.return_60s * 0.35 + features.book_imbalance * 0.15;
+    let direction = features.return_15s * 0.20
+        + features.return_60s * 0.35
+        + features.return_300s * 0.35
+        + features.book_imbalance * 0.10;
     let side = if direction >= 0.03 {
         Side::Long
     } else if direction <= -0.03 {
@@ -176,15 +203,23 @@ fn candidate_from(
     } else {
         return Err(CandidateReject::NeutralDirection);
     };
+    // The medium and slow windows define direction. The fast return and
+    // order book may confirm a trade, but neither can reverse the trend.
+    if features.return_60s.signum() != side.direction()
+        || features.return_300s.signum() != side.direction()
+    {
+        return Err(CandidateReject::ConflictingSignals);
+    }
     let signed_votes = [
         features.return_15s.signum(),
         features.return_60s.signum(),
+        features.return_300s.signum(),
         features.book_imbalance.signum(),
     ]
     .into_iter()
     .filter(|sign| *sign == side.direction())
     .count();
-    if signed_votes < 2 {
+    if signed_votes < 3 {
         return Err(CandidateReject::ConflictingSignals);
     }
     let confidence = (features.cheap_score / 100.0).clamp(0.35, 1.0);
@@ -383,14 +418,54 @@ mod tests {
             },
             ..SymbolState::default()
         };
-        for second in 0..=30 {
+        for second in 0..=300 {
             state.push_sample(crate::model::MarketSample {
-                event_time: now - (30 - second) * 1_000,
-                price: 100.0 - second as f64 * 0.03,
+                event_time: now - (300 - second) * 1_000,
+                price: 108.0 - second as f64 * 0.03,
                 quote_volume: 30_000_000.0,
             });
         }
         let result = candidate_from(&config(), &state, now).unwrap();
         assert_eq!(result.side, Side::Short);
     }
+
+    #[test]
+    fn slow_trend_must_confirm_fast_direction() {
+        let now = 400_000;
+        let mut state = SymbolState {
+            symbol: "ALTUSDT".to_string(),
+            last_price: 101.0,
+            bid: 100.99,
+            ask: 101.01,
+            bid_quantity: 1_000.0,
+            ask_quantity: 800.0,
+            quote_volume: 30_000_000.0,
+            price_received_at: now,
+            book_received_at: now,
+            features: FeatureSnapshot {
+                return_15s: 0.70,
+                return_60s: 0.40,
+                return_300s: -0.80,
+                volume_impulse: 0.01,
+                volatility: 0.20,
+                spread_percent: 0.02,
+                book_imbalance: 0.40,
+                cheap_score: 85.0,
+                updated_at: now,
+            },
+            ..SymbolState::default()
+        };
+        for second in 0..=300 {
+            state.push_sample(crate::model::MarketSample {
+                event_time: now - (300 - second) * 1_000,
+                price: 100.0,
+                quote_volume: 30_000_000.0,
+            });
+        }
+        assert!(matches!(
+            candidate_from(&config(), &state, now),
+            Err(CandidateReject::ConflictingSignals)
+        ));
+    }
 }
+
