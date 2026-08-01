@@ -85,6 +85,22 @@ pub struct SignalDecision {
     pub observed_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ClosedTradeRecord {
+    pub position_id: u64,
+    pub symbol: String,
+    pub side: String,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub exit_reason: String,
+    pub tp_stage: String,
+    pub net_pnl: f64,
+    pub fees: f64,
+    pub funding: f64,
+    pub opened_at: i64,
+    pub closed_at: i64,
+}
+
 pub struct SqliteStore {
     connection: Mutex<Connection>,
 }
@@ -302,6 +318,78 @@ impl SqliteStore {
         }
 
         transaction.commit().context("SQLite commit başarısız")
+    }
+
+    pub fn recent_closed_trades(&self, limit: usize) -> Result<Vec<ClosedTradeRecord>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT
+                    close_event.position_id,
+                    close_event.symbol,
+                    close_event.side,
+                    open_event.price,
+                    close_event.price,
+                    COALESCE(close_event.exit_reason, 'UNKNOWN'),
+                    CASE
+                        WHEN SUM(CASE WHEN event.event_type = 'PARTIAL_EXIT' THEN 1 ELSE 0 END) >= 2
+                            THEN 'TP2 / RUNNER'
+                        WHEN SUM(CASE WHEN event.event_type = 'PARTIAL_EXIT' THEN 1 ELSE 0 END) = 1
+                            THEN 'TP1'
+                        ELSE 'TP YOK'
+                    END,
+                    COALESCE(SUM(CASE
+                        WHEN event.event_type IN ('PARTIAL_EXIT', 'CLOSE') THEN event.net_pnl
+                        ELSE 0
+                    END), 0),
+                    COALESCE(SUM(event.fee), 0),
+                    COALESCE(SUM(CASE
+                        WHEN event.event_type = 'FUNDING' THEN event.funding
+                        ELSE 0
+                    END), 0),
+                    open_event.created_at,
+                    close_event.created_at
+                FROM execution_ledger AS close_event
+                JOIN execution_ledger AS open_event
+                  ON open_event.position_id = close_event.position_id
+                 AND open_event.event_type = 'OPEN'
+                JOIN execution_ledger AS event
+                  ON event.position_id = close_event.position_id
+                WHERE close_event.event_type = 'CLOSE'
+                GROUP BY
+                    close_event.position_id, close_event.symbol, close_event.side,
+                    open_event.price, close_event.price, close_event.exit_reason,
+                    open_event.created_at, close_event.created_at
+                ORDER BY close_event.created_at DESC
+                LIMIT ?1
+                ",
+            )
+            .context("Kapanan işlem sorgusu hazırlanamadı")?;
+        let rows = statement
+            .query_map(params![limit], |row| {
+                let position_id = row.get::<_, i64>(0)?;
+                Ok(ClosedTradeRecord {
+                    position_id: u64::try_from(position_id).map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(0, position_id)
+                    })?,
+                    symbol: row.get(1)?,
+                    side: row.get(2)?,
+                    entry_price: row.get(3)?,
+                    exit_price: row.get(4)?,
+                    exit_reason: row.get(5)?,
+                    tp_stage: row.get(6)?,
+                    net_pnl: row.get(7)?,
+                    fees: row.get(8)?,
+                    funding: row.get(9)?,
+                    opened_at: row.get(10)?,
+                    closed_at: row.get(11)?,
+                })
+            })
+            .context("Kapanan işlemler okunamadı")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("Kapanan işlem satırı çözümlenemedi")
     }
 
     pub fn checkpoint(&self) -> Result<()> {
