@@ -1,6 +1,7 @@
 pub mod config;
 pub mod cost;
 pub mod engine;
+pub mod hybrid;
 pub mod market;
 pub mod model;
 pub mod panel;
