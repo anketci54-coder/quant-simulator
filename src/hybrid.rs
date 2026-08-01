@@ -132,13 +132,21 @@ pub async fn run_hybrid_filter(
     }
 }
 
-async fn fetch_pack(client: &reqwest::Client, base_url: &str, symbol: &str) -> Result<MtfPack, String> {
+async fn fetch_pack(
+    client: &reqwest::Client,
+    base_url: &str,
+    symbol: &str,
+) -> Result<MtfPack, String> {
     let (one, five, fifteen) = tokio::join!(
         fetch_indicators(client, base_url, symbol, "1m"),
         fetch_indicators(client, base_url, symbol, "5m"),
         fetch_indicators(client, base_url, symbol, "15m"),
     );
-    Ok(MtfPack { one: one?, five: five?, fifteen: fifteen? })
+    Ok(MtfPack {
+        one: one?,
+        five: five?,
+        fifteen: fifteen?,
+    })
 }
 
 async fn fetch_indicators(
@@ -177,27 +185,35 @@ async fn fetch_indicators(
         .ok_or_else(|| format!("{interval} insufficient indicator data"))
 }
 
-fn validate_candidate(mut candidate: Candidate, pack: MtfPack, regime: Regime) -> Option<Candidate> {
+fn validate_candidate(
+    mut candidate: Candidate,
+    pack: MtfPack,
+    regime: Regime,
+) -> Option<Candidate> {
     let normalized_trend = (pack.fifteen.ema_fast - pack.fifteen.ema_slow) / pack.fifteen.atr;
     let obi = candidate.features.book_imbalance;
     let long = candidate.side == Side::Long;
     let trend_confirmed = match (regime, candidate.side) {
-        (Regime::Bull, Side::Long) => obi >= 0.12
-            && normalized_trend >= 0.05
-            && pack.fifteen.adx >= 20.0
-            && pack.five.ema_fast > pack.five.ema_slow
-            && pack.five.adx >= 18.0
-            && (52.0..=72.0).contains(&pack.five.rsi)
-            && pack.one.ema_fast >= pack.one.ema_slow
-            && (48.0..=75.0).contains(&pack.one.rsi),
-        (Regime::Bear, Side::Short) => obi <= -0.12
-            && normalized_trend <= -0.05
-            && pack.fifteen.adx >= 20.0
-            && pack.five.ema_fast < pack.five.ema_slow
-            && pack.five.adx >= 18.0
-            && (28.0..=48.0).contains(&pack.five.rsi)
-            && pack.one.ema_fast <= pack.one.ema_slow
-            && (25.0..=52.0).contains(&pack.one.rsi),
+        (Regime::Bull, Side::Long) => {
+            obi >= 0.12
+                && normalized_trend >= 0.05
+                && pack.fifteen.adx >= 20.0
+                && pack.five.ema_fast > pack.five.ema_slow
+                && pack.five.adx >= 18.0
+                && (52.0..=72.0).contains(&pack.five.rsi)
+                && pack.one.ema_fast >= pack.one.ema_slow
+                && (48.0..=75.0).contains(&pack.one.rsi)
+        }
+        (Regime::Bear, Side::Short) => {
+            obi <= -0.12
+                && normalized_trend <= -0.05
+                && pack.fifteen.adx >= 20.0
+                && pack.five.ema_fast < pack.five.ema_slow
+                && pack.five.adx >= 18.0
+                && (28.0..=48.0).contains(&pack.five.rsi)
+                && pack.one.ema_fast <= pack.one.ema_slow
+                && (25.0..=52.0).contains(&pack.one.rsi)
+        }
         _ => false,
     };
     let scalp_confirmed = regime == Regime::Sideways
@@ -231,8 +247,9 @@ fn validate_candidate(mut candidate: Candidate, pack: MtfPack, regime: Regime) -
     let trend_quality = ((pack.fifteen.adx - 18.0) / 22.0).clamp(0.0, 1.0);
     let obi_quality = (obi.abs() / 0.30).clamp(0.0, 1.0);
     let confirmation_quality = ((pack.five.adx - 18.0) / 18.0).clamp(0.0, 1.0);
-    candidate.confidence = (trend_quality * 0.45 + obi_quality * 0.35 + confirmation_quality * 0.20)
-        .clamp(if scalp_confirmed { 0.35 } else { 0.55 }, 1.0);
+    candidate.confidence =
+        (trend_quality * 0.45 + obi_quality * 0.35 + confirmation_quality * 0.20)
+            .clamp(if scalp_confirmed { 0.35 } else { 0.55 }, 1.0);
     candidate.stop_distance = stop_distance;
     candidate.score = (candidate.score * 0.40 + candidate.confidence * 60.0).clamp(0.0, 100.0);
     candidate.market_regime = if scalp_confirmed {
@@ -251,52 +268,88 @@ fn calculate_indicators(highs: &[f64], lows: &[f64], closes: &[f64]) -> Option<I
     }
     let ema_fast = ema(closes, 8)?;
     let ema_slow = ema(closes, 21)?;
-    let changes: Vec<_> = closes.windows(2).map(|window| window[1] - window[0]).collect();
+    let changes: Vec<_> = closes
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect();
     let recent = &changes[changes.len() - changes.len().min(7)..];
     let gains: f64 = recent.iter().map(|change| change.max(0.0)).sum();
     let losses: f64 = recent.iter().map(|change| (-change).max(0.0)).sum();
-    let rsi = if losses <= f64::EPSILON { 100.0 } else { 100.0 - 100.0 / (1.0 + gains / losses) };
-    let true_ranges: Vec<_> = (1..closes.len()).map(|index| {
-        (highs[index] - lows[index])
-            .max((highs[index] - closes[index - 1]).abs())
-            .max((lows[index] - closes[index - 1]).abs())
-    }).collect();
+    let rsi = if losses <= f64::EPSILON {
+        100.0
+    } else {
+        100.0 - 100.0 / (1.0 + gains / losses)
+    };
+    let true_ranges: Vec<_> = (1..closes.len())
+        .map(|index| {
+            (highs[index] - lows[index])
+                .max((highs[index] - closes[index - 1]).abs())
+                .max((lows[index] - closes[index - 1]).abs())
+        })
+        .collect();
     let atr_period = true_ranges.len().min(14);
-    let atr = true_ranges[true_ranges.len() - atr_period..].iter().sum::<f64>() / atr_period as f64;
-    if atr <= 0.0 || !atr.is_finite() { return None; }
+    let atr = true_ranges[true_ranges.len() - atr_period..]
+        .iter()
+        .sum::<f64>()
+        / atr_period as f64;
+    if atr <= 0.0 || !atr.is_finite() {
+        return None;
+    }
     let period = (closes.len() - 1).min(14);
     let start = closes.len() - period;
     let (mut positive_dm, mut negative_dm) = (0.0, 0.0);
     for index in start..closes.len() {
         let upward = highs[index] - highs[index - 1];
         let downward = lows[index - 1] - lows[index];
-        if upward > downward && upward > 0.0 { positive_dm += upward; }
-        if downward > upward && downward > 0.0 { negative_dm += downward; }
+        if upward > downward && upward > 0.0 {
+            positive_dm += upward;
+        }
+        if downward > upward && downward > 0.0 {
+            negative_dm += downward;
+        }
     }
     let positive_di = 100.0 * (positive_dm / period as f64) / atr;
     let negative_di = 100.0 * (negative_dm / period as f64) / atr;
     let adx = if positive_di + negative_di > f64::EPSILON {
         100.0 * (positive_di - negative_di).abs() / (positive_di + negative_di)
-    } else { 0.0 };
-    Some(Indicators { ema_fast, ema_slow, rsi, atr, adx })
+    } else {
+        0.0
+    };
+    Some(Indicators {
+        ema_fast,
+        ema_slow,
+        rsi,
+        atr,
+        adx,
+    })
 }
 
 fn ema(values: &[f64], period: usize) -> Option<f64> {
     let first = *values.first()?;
     let multiplier = 2.0 / (period as f64 + 1.0);
-    Some(values.iter().skip(1).fold(first, |current, value| (value - current) * multiplier + current))
+    Some(values.iter().skip(1).fold(first, |current, value| {
+        (value - current) * multiplier + current
+    }))
 }
 
 fn classify_regime(indicators: Indicators) -> Regime {
-    if indicators.adx < 18.0 { Regime::Sideways }
-    else if indicators.ema_fast > indicators.ema_slow && indicators.rsi >= 52.0 { Regime::Bull }
-    else if indicators.ema_fast < indicators.ema_slow && indicators.rsi <= 48.0 { Regime::Bear }
-    else { Regime::Sideways }
+    if indicators.adx < 18.0 {
+        Regime::Sideways
+    } else if indicators.ema_fast > indicators.ema_slow && indicators.rsi >= 52.0 {
+        Regime::Bull
+    } else if indicators.ema_fast < indicators.ema_slow && indicators.rsi <= 48.0 {
+        Regime::Bear
+    } else {
+        Regime::Sideways
+    }
 }
 
 fn now_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 #[cfg(test)]
