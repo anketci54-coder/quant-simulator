@@ -110,6 +110,7 @@ mod tests {
             stop_distance: 1.0,
             liquidity_notional: 20_000.0,
             observed_at: 1,
+            market_regime: "TEST".to_string(),
             features: FeatureSnapshot::default(),
         };
         let size = size_candidate(

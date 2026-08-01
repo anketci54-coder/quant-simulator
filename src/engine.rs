@@ -235,6 +235,7 @@ fn candidate_from(
         stop_distance: state.last_price * stop_percent,
         liquidity_notional: (state.bid * state.bid_quantity).min(state.ask * state.ask_quantity),
         observed_at: now,
+        market_regime: "V4_PREFILTER".to_string(),
         features,
     })
 }
@@ -343,6 +344,7 @@ mod tests {
             stop_distance: 0.01,
             liquidity_notional: 10_000.0,
             observed_at,
+            market_regime: "TEST".to_string(),
             features: FeatureSnapshot::default(),
         }
     }
