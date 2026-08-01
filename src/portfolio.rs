@@ -104,7 +104,7 @@ impl PortfolioEngine {
             || limits.min_trade_notional <= 0.0
             || limits.min_expected_net_profit < 0.0
         {
-            anyhow::bail!("PortfolioEngine yapılandırması geçersiz");
+            anyhow::bail!("PortfolioEngine yapÄ±landÄ±rmasÄ± geÃ§ersiz");
         }
         Ok(Self {
             snapshot,
@@ -313,7 +313,7 @@ impl PortfolioEngine {
         }
         self.store
             .persist_atomic(&self.snapshot, &[], &decisions, now)
-            .context("Sinyal kapısı retleri atomik kaydedilemedi")
+            .context("Sinyal kapÄ±sÄ± retleri atomik kaydedilemedi")
     }
 
     fn evaluate_open(
@@ -446,7 +446,7 @@ impl PortfolioEngine {
             .retain(|tracked| tracked.position.stage != PositionStage::Closed);
         if let Err(error) = self.store.persist_atomic(&self.snapshot, &ledger, &[], now) {
             self.snapshot = before;
-            return Err(error).context("Pozisyon güncellemesi atomik kaydedilemedi");
+            return Err(error).context("Pozisyon gÃ¼ncellemesi atomik kaydedilemedi");
         }
         Ok(events)
     }
@@ -559,7 +559,7 @@ impl PortfolioEngine {
             .retain(|tracked| tracked.position.stage != PositionStage::Closed);
         if let Err(error) = self.store.persist_atomic(&self.snapshot, &ledger, &[], now) {
             self.snapshot = before;
-            return Err(error).context("Acil çıkış atomik kaydedilemedi");
+            return Err(error).context("Acil Ã§Ä±kÄ±ÅŸ atomik kaydedilemedi");
         }
         Ok(EmergencyExitSummary {
             closed_positions: closed,
@@ -734,6 +734,7 @@ mod tests {
             stop_distance: 1.0,
             liquidity_notional: 1_000_000.0,
             observed_at,
+            market_regime: "TEST".to_string(),
             features: FeatureSnapshot::default(),
         }
     }
