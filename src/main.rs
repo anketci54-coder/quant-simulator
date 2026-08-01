@@ -11,8 +11,8 @@ use quant_bot::{
     config::Config,
     cost::CostModel,
     engine::{run_feature_engine, EngineFrame, HotSet},
+    hybrid::run_hybrid_filter,
     market::{run_market_stream, run_universe_manager, SymbolStore, Universe},
-    model::Side,
     panel::{run_panel, DashboardSnapshot, EmergencyCommand, PositionView},
     portfolio::{PortfolioEngine, PortfolioLimits, Quote},
     position::{ExitReason, PositionEvent, PositionPolicy, PositionStage},
@@ -35,12 +35,14 @@ async fn main() -> Result<()> {
         safety_buffer_bps: config.break_even_safety_bps,
     };
     let client = reqwest::Client::builder()
-        .user_agent("quant-simulator/0.2 MTF_V4")
+        .user_agent("quant-simulator/0.3 MTF_HYBRID")
         .build()?;
     let universe = Universe::new();
     let store: SymbolStore = Arc::new(DashMap::new());
     let (universe_ready_tx, mut universe_ready_rx) = watch::channel(false);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (raw_tx, raw_rx) = watch::channel(EngineFrame::default());
+    let raw_set: HotSet = Arc::new(raw_tx);
     let (hot_tx, mut hot_rx) = watch::channel(EngineFrame::default());
     let hot_set: HotSet = Arc::new(hot_tx);
     let (dashboard_tx, dashboard_rx) = watch::channel(DashboardSnapshot::default());
@@ -95,6 +97,12 @@ async fn main() -> Result<()> {
     tokio::spawn(run_feature_engine(
         config.clone(),
         store.clone(),
+        raw_set,
+        shutdown_rx.clone(),
+    ));
+    tokio::spawn(run_hybrid_filter(
+        config.clone(),
+        raw_rx,
         hot_set,
         shutdown_rx,
     ));
@@ -109,7 +117,7 @@ async fn main() -> Result<()> {
     });
 
     println!(
-        "MTF_V4 mass-market engine started with {} Futures symbols; restored_positions={}",
+        "MTF_HYBRID engine started with {} Futures symbols; restored_positions={}",
         universe.len(),
         portfolio.snapshot().positions.len()
     );
@@ -321,10 +329,7 @@ async fn main() -> Result<()> {
                         };
                         drop(state);
                         last_entry_attempt.insert(candidate.symbol.clone(), now);
-                        let regime = match candidate.side {
-                            Side::Long => "SYMBOL_BULL",
-                            Side::Short => "SYMBOL_BEAR",
-                        };
+                        let regime = candidate.market_regime.as_str();
                         let result = portfolio
                             .try_open(candidate, &meta, quote, regime, now)
                             .with_context(|| {
