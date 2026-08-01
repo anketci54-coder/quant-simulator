@@ -81,8 +81,8 @@ pub async fn run_panel(
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
-        .with_context(|| format!("Panel {bind} adresine bağlanamadı"))?;
-    println!("MTF_V4 panel listening on {bind}");
+        .with_context(|| format!("Panel {bind} adresine baÄŸlanamadÄ±"))?;
+    println!("MTF_HYBRID panel listening on {bind}");
     axum::serve(listener, app)
         .await
         .context("Panel sunucusu durdu")
@@ -98,7 +98,7 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if !constant_time_eq(supplied.as_bytes(), state.action_token.as_bytes()) {
-        return (StatusCode::FORBIDDEN, "Geçersiz işlem anahtarı").into_response();
+        return (StatusCode::FORBIDDEN, "GeÃ§ersiz iÅŸlem anahtarÄ±").into_response();
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     if state
@@ -109,7 +109,7 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
     {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Portföy motoruna ulaşılamadı",
+            "PortfÃ¶y motoruna ulaÅŸÄ±lamadÄ±",
         )
             .into_response();
     }
@@ -124,7 +124,7 @@ async fn emergency_exit(State(state): State<PanelState>, headers: HeaderMap) -> 
         Ok(Err(error)) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Acil çıkış yanıtı alınamadı",
+            "Acil Ã§Ä±kÄ±ÅŸ yanÄ±tÄ± alÄ±namadÄ±",
         )
             .into_response(),
     }
@@ -156,7 +156,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Quant Futures · __STRATEGY_VERSION__</title>
+<title>Quant Futures Â· __STRATEGY_VERSION__</title>
 <style>
 :root{color-scheme:dark;--bg:#05080d;--panel:#0e1623;--panel2:#101c2c;--line:#213149;--muted:#8291a8;--text:#f6f8fc;--gold:#f5c542;--green:#26d99a;--red:#ff5277;--blue:#4c8dff}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% -10%,#10213b 0,transparent 34%),radial-gradient(circle at 95% 0,#2b2210 0,transparent 25%),var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
@@ -171,22 +171,22 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <body>
 <main class="shell">
   <header class="topbar">
-    <div class="logo">Q</div><div class="brand"><h1>Quant Futures</h1><p>MTF_V4 · maliyet kontrollü piyasa simülasyonu</p></div>
-    <div class="spacer"></div><span class="badge">SİMÜLASYON</span>
-    <div class="status"><span class="dot"></span><span id="status">Motor başlatılıyor</span></div>
-    <button class="panic" id="panic">ACİL ÇIKIŞ · TÜMÜNÜ KAPAT</button>
+    <div class="logo">Q</div><div class="brand"><h1>Quant Hybrid</h1><p>V3 sinyal Â· V4 risk ve yÃ¼rÃ¼tme simÃ¼lasyonu</p></div>
+    <div class="spacer"></div><span class="badge">SÄ°MÃœLASYON</span>
+    <div class="status"><span class="dot"></span><span id="status">Motor baÅŸlatÄ±lÄ±yor</span></div>
+    <button class="panic" id="panic">ACÄ°L Ã‡IKIÅ Â· TÃœMÃœNÃœ KAPAT</button>
   </header>
   <section class="metrics">
-    <div class="metric"><div class="label">Toplam Bakiye</div><div class="value" id="balance">—</div></div>
-    <div class="metric"><div class="label">Gerçekleşen Net K/Z</div><div class="value" id="realized">—</div></div>
-    <div class="metric"><div class="label">Açık Net K/Z</div><div class="value" id="unrealized">—</div></div>
-    <div class="metric"><div class="label">Kullanılan Marjin</div><div class="value" id="used">—</div></div>
-    <div class="metric"><div class="label">Serbest Marjin</div><div class="value" id="free">—</div></div>
-    <div class="metric"><div class="label">Takip Edilen Piyasa</div><div class="value" id="tracked">—</div></div>
+    <div class="metric"><div class="label">Toplam Bakiye</div><div class="value" id="balance">â€”</div></div>
+    <div class="metric"><div class="label">GerÃ§ekleÅŸen Net K/Z</div><div class="value" id="realized">â€”</div></div>
+    <div class="metric"><div class="label">AÃ§Ä±k Net K/Z</div><div class="value" id="unrealized">â€”</div></div>
+    <div class="metric"><div class="label">KullanÄ±lan Marjin</div><div class="value" id="used">â€”</div></div>
+    <div class="metric"><div class="label">Serbest Marjin</div><div class="value" id="free">â€”</div></div>
+    <div class="metric"><div class="label">Takip Edilen Piyasa</div><div class="value" id="tracked">â€”</div></div>
   </section>
-  <div class="section-head"><h2>Açık Pozisyonlar</h2><small id="summary">—</small></div>
-  <section class="positions" id="positions"><div class="empty">Piyasa verisi bekleniyor…</div></section>
-  <div class="footer">Komisyon, slippage ve fonlama net PnL içindedir · Son bacak sabit TP olmadan trendi izler.</div>
+  <div class="section-head"><h2>AÃ§Ä±k Pozisyonlar</h2><small id="summary">â€”</small></div>
+  <section class="positions" id="positions"><div class="empty">Piyasa verisi bekleniyorâ€¦</div></section>
+  <div class="footer">Komisyon, slippage ve fonlama net PnL iÃ§indedir Â· Son bacak sabit TP olmadan trendi izler.</div>
 </main>
 <script>
 const ACTION_TOKEN=__ACTION_TOKEN__;
@@ -205,21 +205,21 @@ function render(d){
  setMoney('balance',d.balance);setMoney('realized',d.realized_net_pnl,true);setMoney('unrealized',d.unrealized_net_pnl,true);
  document.getElementById('used').textContent=cash(d.used_margin);document.getElementById('free').textContent=cash(d.free_margin);
  document.getElementById('tracked').textContent=count.format(d.tracked_symbols);
- document.getElementById('summary').textContent=`${d.positions.length} pozisyon · ${d.strategy_version}`;
+ document.getElementById('summary').textContent=`${d.positions.length} pozisyon Â· ${d.strategy_version}`;
  const root=document.getElementById('positions');root.replaceChildren();
- if(!d.positions.length){const e=document.createElement('div');e.className='empty';e.textContent='Henüz açık pozisyon yok.';root.append(e);return}
+ if(!d.positions.length){const e=document.createElement('div');e.className='empty';e.textContent='HenÃ¼z aÃ§Ä±k pozisyon yok.';root.append(e);return}
  for(const p of d.positions){
   const card=document.createElement('article');card.className=`position ${p.side==='LONG'?'long':'short'}`;
   const total=p.realized_net_pnl+p.unrealized_net_pnl;
   card.innerHTML=`<div class="phead"><div><div class="symbol"></div><div class="meta"></div></div><span class="side"></span><div class="pnl"></div></div>
-  <div class="grid3"><div class="cell"><span class="label">Giriş</span><b>${price(p.entry)}</b></div><div class="cell"><span class="label">Anlık</span><b>${price(p.current)}</b></div><div class="cell"><span class="label">Kalan Miktar</span><b>${qty.format(p.remaining_quantity)}</b></div></div>
-  <div class="levels"><span>Stop<b>${price(p.stop)}</b></span><span>TP1 · %40<b>${price(p.tp1)}</b></span><span>TP2 · %40<b>${price(p.tp2)}</b></span><span>Kalan Marjin<b>${cash(p.remaining_margin)}</b></span><span>Gerçekleşen<b class="realized-pnl">${signedCash(p.realized_net_pnl)}</b></span><span>Fonlama<b>${cash(p.funding_cost)}</b></span></div>`;
-  card.querySelector('.symbol').textContent=p.symbol;card.querySelector('.meta').textContent=`#${p.id} · ${p.leverage}x · ${p.stage} · runner %20`;
+  <div class="grid3"><div class="cell"><span class="label">GiriÅŸ</span><b>${price(p.entry)}</b></div><div class="cell"><span class="label">AnlÄ±k</span><b>${price(p.current)}</b></div><div class="cell"><span class="label">Kalan Miktar</span><b>${qty.format(p.remaining_quantity)}</b></div></div>
+  <div class="levels"><span>Stop<b>${price(p.stop)}</b></span><span>TP1 Â· %40<b>${price(p.tp1)}</b></span><span>TP2 Â· %40<b>${price(p.tp2)}</b></span><span>Kalan Marjin<b>${cash(p.remaining_margin)}</b></span><span>GerÃ§ekleÅŸen<b class="realized-pnl">${signedCash(p.realized_net_pnl)}</b></span><span>Fonlama<b>${cash(p.funding_cost)}</b></span></div>`;
+  card.querySelector('.symbol').textContent=p.symbol;card.querySelector('.meta').textContent=`#${p.id} Â· ${p.leverage}x Â· ${p.stage} Â· runner %20`;
   card.querySelector('.side').textContent=p.side;const pnl=card.querySelector('.pnl');pnl.textContent=signedCash(total);tone(pnl,total);tone(card.querySelector('.realized-pnl'),p.realized_net_pnl);root.append(card);
  }
 }
 async function refresh(){try{const r=await fetch('/api/dashboard',{cache:'no-store'});if(r.ok)render(await r.json())}catch{}}
-document.getElementById('panic').onclick=async function(){this.disabled=true;this.textContent='KAPATILIYOR…';try{const r=await fetch('/api/emergency-exit',{method:'POST',headers:{'x-action-token':ACTION_TOKEN}});const x=await r.json();if(!r.ok)throw new Error(x);this.textContent=`KAPATILDI · ${x.closed_positions} POZİSYON`;await refresh()}catch(e){this.disabled=false;this.textContent='HATA · TEKRAR DENE'}};
+document.getElementById('panic').onclick=async function(){this.disabled=true;this.textContent='KAPATILIYORâ€¦';try{const r=await fetch('/api/emergency-exit',{method:'POST',headers:{'x-action-token':ACTION_TOKEN}});const x=await r.json();if(!r.ok)throw new Error(x);this.textContent=`KAPATILDI Â· ${x.closed_positions} POZÄ°SYON`;await refresh()}catch(e){this.disabled=false;this.textContent='HATA Â· TEKRAR DENE'}};
 refresh();setInterval(refresh,1000);
 </script>
 </body>
