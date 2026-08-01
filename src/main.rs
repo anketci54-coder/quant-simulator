@@ -13,7 +13,7 @@ use quant_bot::{
     engine::{run_feature_engine, EngineFrame, HotSet},
     hybrid::run_hybrid_filter,
     market::{run_market_stream, run_universe_manager, SymbolStore, Universe},
-    panel::{run_panel, DashboardSnapshot, EmergencyCommand, PositionView},
+    panel::{run_panel, ClosedTradeView, DashboardSnapshot, EmergencyCommand, PositionView},
     portfolio::{PortfolioEngine, PortfolioLimits, Quote},
     position::{ExitReason, PositionEvent, PositionPolicy, PositionStage},
     storage::SqliteStore,
@@ -222,6 +222,7 @@ async fn main() -> Result<()> {
                 dashboard_tx.send_replace(build_dashboard(
                     &portfolio,
                     &store,
+                    &database,
                     config.leverage,
                     config.entry_enabled,
                     store.len(),
@@ -265,6 +266,7 @@ async fn main() -> Result<()> {
                 dashboard_tx.send_replace(build_dashboard(
                     &portfolio,
                     &store,
+                    &database,
                     config.leverage,
                     config.entry_enabled,
                     store.len(),
@@ -382,6 +384,7 @@ async fn shutdown_signal() {
 fn build_dashboard(
     portfolio: &PortfolioEngine,
     store: &SymbolStore,
+    database: &SqliteStore,
     leverage: f64,
     runtime_entry_enabled: bool,
     tracked_symbols: usize,
@@ -411,8 +414,8 @@ fn build_dashboard(
             .unwrap_or((tracked.position.entry_fill, 0.0));
         unrealized_net_pnl += open_pnl;
         let stage = match tracked.position.stage {
-            PositionStage::BeforeTp1 => "TP1 BEKLÄ°YOR",
-            PositionStage::AfterTp1 => "TP1 GERÃ‡EKLEÅTÄ°",
+            PositionStage::BeforeTp1 => "TP1 BEKLİYOR",
+            PositionStage::AfterTp1 => "TP1 GERÇEKLEŞTİ",
             PositionStage::Runner => "RUNNER",
             PositionStage::Closed => "KAPALI",
         };
@@ -438,18 +441,40 @@ fn build_dashboard(
         });
     }
     let entries_paused = !runtime_entry_enabled || portfolio.snapshot().entries_paused;
+    let closed_trades = database
+        .recent_closed_trades(50)
+        .unwrap_or_else(|error| {
+            eprintln!("Kapanan işlem geçmişi okunamadı: {error:#}");
+            Vec::new()
+        })
+        .into_iter()
+        .map(|trade| ClosedTradeView {
+            position_id: trade.position_id,
+            symbol: trade.symbol,
+            side: trade.side,
+            entry_price: trade.entry_price,
+            exit_price: trade.exit_price,
+            exit_reason: trade.exit_reason,
+            tp_stage: trade.tp_stage,
+            net_pnl: trade.net_pnl,
+            fees: trade.fees,
+            funding: trade.funding,
+            opened_at: trade.opened_at,
+            closed_at: trade.closed_at,
+        })
+        .collect();
     DashboardSnapshot {
         strategy_version: quant_bot::model::STRATEGY_VERSION.to_string(),
         status: if !runtime_entry_enabled {
-            "ENTRY_ENABLED=false: yeni giriÅŸler durduruldu".to_string()
+            "ENTRY_ENABLED=false: yeni girişler durduruldu".to_string()
         } else if entries_paused {
             portfolio
                 .snapshot()
                 .pause_reason
                 .clone()
-                .unwrap_or_else(|| "Yeni giriÅŸler durduruldu".to_string())
+                .unwrap_or_else(|| "Yeni girişler durduruldu".to_string())
         } else {
-            "TÃ¼m USD-M Futures pariteleri eÅŸzamanlÄ± taranÄ±yor".to_string()
+            "Tüm USD-M Futures pariteleri eşzamanlı taranıyor".to_string()
         },
         entries_paused,
         balance: portfolio.snapshot().balance + unrealized_net_pnl,
@@ -460,5 +485,6 @@ fn build_dashboard(
         tracked_symbols,
         updated_at: now,
         positions,
+        closed_trades,
     }
 }
