@@ -187,8 +187,7 @@ async fn fetch_indicators(
                                 .and_then(Value::as_str)
                                 .and_then(|value| value.parse::<f64>().ok())
                         };
-                        if let (Some(high), Some(low), Some(close)) =
-                            (parse(2), parse(3), parse(4))
+                        if let (Some(high), Some(low), Some(close)) = (parse(2), parse(3), parse(4))
                         {
                             highs.push(high);
                             lows.push(low);
