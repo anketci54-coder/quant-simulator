@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-pub const STRATEGY_VERSION: &str = "MTF_HYBRID";
+pub const STRATEGY_VERSION: &str = "MTF_V5";
 pub const MAX_SAMPLES: usize = 1_800;
 
 #[derive(Clone, Debug, Default)]
