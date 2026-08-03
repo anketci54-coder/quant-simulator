@@ -365,6 +365,7 @@ mod tests {
             symbol_cooldown: Duration::from_secs(1_200),
             leverage: 3.0,
             risk_per_trade: 0.005,
+            long_risk_scale: 0.50,
             max_portfolio_risk: 0.02,
             max_trade_allocation: 0.10,
             max_total_margin_fraction: 0.40,
