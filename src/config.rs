@@ -18,6 +18,7 @@ pub struct Config {
     pub symbol_cooldown: Duration,
     pub leverage: f64,
     pub risk_per_trade: f64,
+    pub long_risk_scale: f64,
     pub max_portfolio_risk: f64,
     pub max_trade_allocation: f64,
     pub max_total_margin_fraction: f64,
@@ -64,6 +65,7 @@ impl Config {
             symbol_cooldown: Duration::from_secs(parse("SYMBOL_COOLDOWN_SECONDS", 1_200u64)?),
             leverage: parse("LEVERAGE", 3.0f64)?,
             risk_per_trade: parse("RISK_PER_TRADE", 0.005f64)?,
+            long_risk_scale: parse("LONG_RISK_SCALE", 0.50f64)?,
             max_portfolio_risk: parse("MAX_PORTFOLIO_RISK", 0.02f64)?,
             max_trade_allocation: parse("MAX_TRADE_ALLOCATION", 0.10f64)?,
             max_total_margin_fraction: parse("MAX_TOTAL_MARGIN_FRACTION", 0.40f64)?,
@@ -105,6 +107,9 @@ impl Config {
         }
         if !(0.0..=0.02).contains(&self.risk_per_trade) {
             bail!("RISK_PER_TRADE must be between 0 and 0.02");
+        }
+        if !(0.10..=1.0).contains(&self.long_risk_scale) {
+            bail!("LONG_RISK_SCALE must be between 0.10 and 1.0");
         }
         if !(0.0..=0.10).contains(&self.max_portfolio_risk) {
             bail!("MAX_PORTFOLIO_RISK must be between 0 and 0.10");
