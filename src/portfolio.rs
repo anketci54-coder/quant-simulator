@@ -66,6 +66,7 @@ pub struct PortfolioLimits {
     pub max_same_side_positions: usize,
     pub leverage: f64,
     pub risk_per_trade: f64,
+    pub long_risk_scale: f64,
     pub max_portfolio_risk: f64,
     pub max_trade_allocation: f64,
     pub max_total_margin_fraction: f64,
@@ -98,6 +99,7 @@ impl PortfolioEngine {
             || limits.max_same_side_positions > limits.max_positions
             || !(1.0..=3.0).contains(&limits.leverage)
             || !(0.0..=0.02).contains(&limits.risk_per_trade)
+            || !(0.10..=1.0).contains(&limits.long_risk_scale)
             || !(0.0..=0.10).contains(&limits.max_portfolio_risk)
             || !(0.01..=0.10).contains(&limits.max_trade_allocation)
             || !(0.05..=1.0).contains(&limits.max_total_margin_fraction)
@@ -356,9 +358,13 @@ impl PortfolioEngine {
                 + self.costs.expected_exit_slippage_bps
                 + self.costs.safety_buffer_bps)
                 / 10_000.0;
+        let mut sizing_candidate = candidate.clone();
+        if sizing_candidate.side == Side::Long {
+            sizing_candidate.confidence *= self.limits.long_risk_scale;
+        }
         let size = size_candidate(
             self.account_equity(),
-            candidate,
+            &sizing_candidate,
             RiskLimits {
                 risk_fraction: self.limits.risk_per_trade,
                 allocation_fraction: self.limits.max_trade_allocation,
@@ -714,6 +720,7 @@ mod tests {
                 max_same_side_positions: 3,
                 leverage: 3.0,
                 risk_per_trade: 0.005,
+                long_risk_scale: 0.50,
                 max_portfolio_risk: 0.02,
                 max_trade_allocation: 0.10,
                 max_total_margin_fraction: 0.40,
