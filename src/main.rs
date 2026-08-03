@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
         safety_buffer_bps: config.break_even_safety_bps,
     };
     let client = reqwest::Client::builder()
-        .user_agent("quant-simulator/0.3 MTF_HYBRID")
+        .user_agent("quant-simulator/0.4 MTF_V5")
         .build()?;
     let universe = Universe::new();
     let store: SymbolStore = Arc::new(DashMap::new());
@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
             max_same_side_positions: config.max_same_side_positions,
             leverage: config.leverage,
             risk_per_trade: config.risk_per_trade,
+            long_risk_scale: config.long_risk_scale,
             max_portfolio_risk: config.max_portfolio_risk,
             max_trade_allocation: config.max_trade_allocation,
             max_total_margin_fraction: config.max_total_margin_fraction,
@@ -117,7 +118,7 @@ async fn main() -> Result<()> {
     });
 
     println!(
-        "MTF_HYBRID engine started with {} Futures symbols; restored_positions={}",
+        "MTF_V5 engine started with {} Futures symbols; restored_positions={}",
         universe.len(),
         portfolio.snapshot().positions.len()
     );

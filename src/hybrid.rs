@@ -1,8 +1,8 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures_util::future::join_all;
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
 
 use crate::{
     config::Config,
@@ -11,8 +11,10 @@ use crate::{
 };
 
 const VALIDATION_LIMIT: usize = 12;
-const INDICATOR_CACHE_MS: i64 = 45_000;
-const BTC_REGIME_CACHE_MS: i64 = 60_000;
+const INDICATOR_CACHE_MS: i64 = 60_000;
+const MAX_USABLE_INDICATOR_AGE_MS: i64 = 120_000;
+const BTC_REGIME_CACHE_MS: i64 = 300_000;
+const MAX_CONCURRENT_PACK_FETCHES: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct Indicators {
@@ -55,6 +57,7 @@ pub async fn run_hybrid_filter(
             return;
         }
     };
+    let fetch_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_PACK_FETCHES));
     let mut cache: HashMap<String, (i64, MtfPack)> = HashMap::new();
     let mut btc_cache: Option<(i64, Regime)> = None;
 
@@ -100,8 +103,13 @@ pub async fn run_hybrid_filter(
                 let fetched = join_all(missing.into_iter().map(|symbol| {
                     let client = client.clone();
                     let base_url = base_url.clone();
+                    let fetch_limit = fetch_limit.clone();
                     async move {
-                        let result = fetch_pack(&client, &base_url, &symbol).await;
+                        let permit = fetch_limit.acquire_owned().await;
+                        let result = match permit {
+                            Ok(_permit) => fetch_pack(&client, &base_url, &symbol).await,
+                            Err(_) => Err("MTF fetch limiter closed".to_string()),
+                        };
                         (symbol, result)
                     }
                 })).await;
@@ -114,9 +122,12 @@ pub async fn run_hybrid_filter(
 
                 let mut candidates = Vec::new();
                 for candidate in selected {
-                    let Some((_, pack)) = cache.get(&candidate.symbol).copied() else {
+                    let Some((cached_at, pack)) = cache.get(&candidate.symbol).copied() else {
                         continue;
                     };
+                    if now.saturating_sub(cached_at) > MAX_USABLE_INDICATOR_AGE_MS {
+                        continue;
+                    }
                     if let Some(candidate) = validate_candidate(candidate, pack, regime) {
                         candidates.push(candidate);
                     }
@@ -156,33 +167,45 @@ async fn fetch_indicators(
     interval: &str,
 ) -> Result<Indicators, String> {
     let url = format!("{}/fapi/v1/klines", base_url.trim_end_matches('/'));
-    let rows = client
-        .get(url)
-        .query(&[("symbol", symbol), ("interval", interval), ("limit", "60")])
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .map_err(|error| format!("{interval} request failed: {error}"))?
-        .json::<Vec<Vec<Value>>>()
-        .await
-        .map_err(|error| format!("{interval} parse failed: {error}"))?;
-    let mut highs = Vec::with_capacity(rows.len());
-    let mut lows = Vec::with_capacity(rows.len());
-    let mut closes = Vec::with_capacity(rows.len());
-    for row in rows {
-        let parse = |index: usize| {
-            row.get(index)
-                .and_then(Value::as_str)
-                .and_then(|value| value.parse::<f64>().ok())
-        };
-        if let (Some(high), Some(low), Some(close)) = (parse(2), parse(3), parse(4)) {
-            highs.push(high);
-            lows.push(low);
-            closes.push(close);
+    let mut last_error = String::new();
+    for attempt in 0..2 {
+        let response = client
+            .get(&url)
+            .query(&[("symbol", symbol), ("interval", interval), ("limit", "60")])
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status);
+        match response {
+            Ok(response) => match response.json::<Vec<Vec<Value>>>().await {
+                Ok(rows) => {
+                    let mut highs = Vec::with_capacity(rows.len());
+                    let mut lows = Vec::with_capacity(rows.len());
+                    let mut closes = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let parse = |index: usize| {
+                            row.get(index)
+                                .and_then(Value::as_str)
+                                .and_then(|value| value.parse::<f64>().ok())
+                        };
+                        if let (Some(high), Some(low), Some(close)) = (parse(2), parse(3), parse(4))
+                        {
+                            highs.push(high);
+                            lows.push(low);
+                            closes.push(close);
+                        }
+                    }
+                    return calculate_indicators(&highs, &lows, &closes)
+                        .ok_or_else(|| format!("{interval} insufficient indicator data"));
+                }
+                Err(error) => last_error = format!("{interval} parse failed: {error}"),
+            },
+            Err(error) => last_error = format!("{interval} request failed: {error}"),
+        }
+        if attempt == 0 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
-    calculate_indicators(&highs, &lows, &closes)
-        .ok_or_else(|| format!("{interval} insufficient indicator data"))
+    Err(last_error)
 }
 
 fn validate_candidate(
@@ -195,12 +218,12 @@ fn validate_candidate(
     let long = candidate.side == Side::Long;
     let trend_confirmed = match (regime, candidate.side) {
         (Regime::Bull, Side::Long) => {
-            obi >= 0.12
-                && normalized_trend >= 0.05
-                && pack.fifteen.adx >= 20.0
+            obi >= 0.16
+                && normalized_trend >= 0.08
+                && pack.fifteen.adx >= 22.0
                 && pack.five.ema_fast > pack.five.ema_slow
-                && pack.five.adx >= 18.0
-                && (52.0..=72.0).contains(&pack.five.rsi)
+                && pack.five.adx >= 20.0
+                && (54.0..=70.0).contains(&pack.five.rsi)
                 && pack.one.ema_fast >= pack.one.ema_slow
                 && (48.0..=75.0).contains(&pack.one.rsi)
         }
@@ -218,9 +241,9 @@ fn validate_candidate(
     };
     let scalp_confirmed = regime == Regime::Sideways
         && if long {
-            obi >= 0.18
-                && normalized_trend >= 0.10
-                && pack.fifteen.adx >= 25.0
+            obi >= 0.22
+                && normalized_trend >= 0.12
+                && pack.fifteen.adx >= 27.0
                 && pack.five.ema_fast > pack.five.ema_slow
                 && pack.five.adx >= 22.0
                 && (55.0..=76.0).contains(&pack.five.rsi)

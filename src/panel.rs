@@ -99,7 +99,7 @@ pub async fn run_panel(
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("Panel {bind} adresine bağlanamadı"))?;
-    println!("MTF_HYBRID panel listening on {bind}");
+    println!("MTF_V5 panel listening on {bind}");
     axum::serve(listener, app)
         .await
         .context("Panel sunucusu durdu")
@@ -188,7 +188,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 <body>
 <main class="shell">
   <header class="topbar">
-    <div class="logo">Q</div><div class="brand"><h1>Quant Hybrid</h1><p>V3 sinyal · V4 risk ve yürütme simülasyonu</p></div>
+    <div class="logo">Q</div><div class="brand"><h1>Quant V5 Shadow</h1><p>V3 sinyal · maliyet ayarlı V5 risk ve yürütme</p></div>
     <div class="spacer"></div><span class="badge">SİMÜLASYON</span>
     <div class="status"><span class="dot"></span><span id="status">Motor başlatılıyor</span></div>
     <button class="panic" id="panic">ACİL ÇIKIŞ · TÜMÜNÜ KAPAT</button>
