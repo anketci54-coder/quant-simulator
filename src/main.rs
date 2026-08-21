@@ -526,9 +526,13 @@ fn load_consecutive_losses(conn: &Mutex<Connection>) -> usize {
     let Ok(c) = conn.lock() else {
         return 0;
     };
-    let Ok(mut statement) =
-        c.prepare("SELECT pnl_usd FROM closed_trades ORDER BY id DESC LIMIT 20")
-    else {
+    let Ok(mut statement) = c.prepare(
+        "SELECT pnl_usd
+             FROM closed_trades
+             WHERE date(closed_at, 'unixepoch') = date('now')
+             ORDER BY closed_at DESC, id DESC
+             LIMIT 20",
+    ) else {
         return 0;
     };
     let Ok(rows) = statement.query_map([], |row| row.get::<_, f64>(0)) else {
@@ -1073,7 +1077,8 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
         .lock()
         .map(|state| state.accounting.current_balance)
         .unwrap_or(0.0);
-    let session_starting_balance = load_or_create_daily_starting_balance(&db_conn, current_balance);
+    let mut session_starting_balance =
+        load_or_create_daily_starting_balance(&db_conn, current_balance);
     loop {
         if symbol_filters.is_empty() {
             match fetch_symbol_filters(&client, &config) {
@@ -1385,6 +1390,12 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                 }
 
                 state.accounting.current_balance += batch_realized_pnl;
+
+                session_starting_balance = load_or_create_daily_starting_balance(
+                    &db_conn,
+                    state.accounting.current_balance,
+                );
+                consecutive_losses = load_consecutive_losses(&db_conn);
 
                 let session_drawdown = if session_starting_balance > 0.0 {
                     ((session_starting_balance - state.accounting.current_balance)
