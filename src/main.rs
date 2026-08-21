@@ -299,6 +299,11 @@ async fn main() -> Result<()> {
                         recent_entries.pop_front();
                     }
                     for candidate in &frame.candidates {
+                        if !config.allow_short_entries
+                            && matches!(candidate.side, quant_bot::model::Side::Short)
+                        {
+                            continue;
+                        }
                         if portfolio.snapshot().positions.len() >= config.max_positions {
                             break;
                         }
