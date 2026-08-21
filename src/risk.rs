@@ -36,7 +36,9 @@ pub fn size_candidate(
         return None;
     }
     let confidence = candidate.confidence.clamp(0.0, 1.0);
-    let risk_budget = balance * limits.risk_fraction * confidence;
+    // Confidence already gates entries and expected profit; applying it here again
+    // would double-discount otherwise valid positions and leave capital underused.
+    let risk_budget = balance * limits.risk_fraction;
     let cost_per_unit = candidate.price * limits.expected_round_trip_cost_rate;
     let loss_per_unit = candidate.stop_distance + cost_per_unit;
     let risk_quantity = risk_budget / loss_per_unit;
@@ -126,7 +128,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(size.risk <= 40.0 + f64::EPSILON);
+        assert!(size.risk <= 50.0 + f64::EPSILON);
         assert!(size.margin <= 1_000.0 + f64::EPSILON);
     }
 
