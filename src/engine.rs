@@ -359,6 +359,7 @@ mod tests {
             panel_action_token: "0123456789abcdef0123456789abcdef".to_string(),
             initial_balance: 10_000.0,
             entry_enabled: true,
+            allow_short_entries: true,
             max_positions: 5,
             max_same_side_positions: 3,
             max_entries_per_minute: 2,
