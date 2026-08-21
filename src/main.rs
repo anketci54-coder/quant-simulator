@@ -189,6 +189,7 @@ enum PositionLifecycle {
 struct Config {
     base_url: String,
     entry_enabled: bool,
+    allow_short_entries: bool,
     max_positions: usize,
     max_same_side_positions: usize,
     max_signal_candidates: usize,
@@ -1567,6 +1568,9 @@ fn run_engine(config: Config, shared_state: SharedState, db_conn: Arc<Mutex<Conn
                         } else {
                             continue;
                         };
+                        if side == "SHORT" && !config.allow_short_entries {
+                            continue;
+                        }
                         let already_active = still_active.iter().any(|p| p.symbol == t.symbol);
                         let now = unix_timestamp();
                         let cooling_down =
@@ -1946,6 +1950,9 @@ fn main() {
         entry_enabled: env::var("ENTRY_ENABLED")
             .map(|value| value.eq_ignore_ascii_case("true"))
             .unwrap_or(false),
+        allow_short_entries: env::var("ALLOW_SHORT_ENTRIES")
+            .map(|value| value.eq_ignore_ascii_case("true"))
+            .unwrap_or(true),
         max_positions: env::var("MAX_POSITIONS")
             .ok()
             .and_then(|value| value.parse().ok())
