@@ -2,12 +2,12 @@ use std::{
     collections::HashSet,
     str,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::{sync::watch, time};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -24,6 +24,13 @@ struct ApplyStats {
     mini_tickers: usize,
     book_tickers: usize,
     mark_prices: usize,
+}
+
+const STREAM_IDLE_AFTER: Duration = Duration::from_secs(30);
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+fn stream_is_stalled(last_message_at: Instant) -> bool {
+    last_message_at.elapsed() >= STREAM_IDLE_AFTER
 }
 
 impl ApplyStats {
@@ -187,11 +194,15 @@ pub async fn run_market_stream(
             Ok((stream, _)) => {
                 backoff = 1;
                 println!("Market stream connected source={source}");
-                let (_, mut reader) = stream.split();
+                let (mut writer, mut reader) = stream.split();
                 let mut applied_events = ApplyStats::default();
+                let mut last_message_at = Instant::now();
                 let mut health_interval = time::interval(Duration::from_secs(60));
+                let mut idle_interval = time::interval(IDLE_CHECK_INTERVAL);
                 health_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+                idle_interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
                 health_interval.tick().await;
+                idle_interval.tick().await;
                 loop {
                     tokio::select! {
                         changed = shutdown.changed() => {
@@ -229,7 +240,17 @@ pub async fn run_market_stream(
                             );
                             applied_events = ApplyStats::default();
                         }
+                        _ = idle_interval.tick() => {
+                            if stream_is_stalled(last_message_at) {
+                                eprintln!(
+                                    "Market stream stalled source={source} idle_seconds={}; reconnecting",
+                                    last_message_at.elapsed().as_secs()
+                                );
+                                break;
+                            }
+                        }
                         message = reader.next() => {
+                            last_message_at = Instant::now();
                             match message {
                                 Some(Ok(Message::Text(text))) => {
                                     match apply_message(&text, &universe, &store) {
@@ -246,6 +267,12 @@ pub async fn run_market_stream(
                                         Err(error) => {
                                             eprintln!("Binary market event rejected: {error:#}")
                                         }
+                                    }
+                                }
+                                Some(Ok(Message::Ping(payload))) => {
+                                    if let Err(error) = writer.send(Message::Pong(payload)).await {
+                                        eprintln!("Market stream pong error: {error}");
+                                        break;
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) | None => break,

@@ -166,10 +166,17 @@ async fn fetch_indicators(
         .json::<Vec<Vec<Value>>>()
         .await
         .map_err(|error| format!("{interval} parse failed: {error}"))?;
-    let mut highs = Vec::with_capacity(rows.len());
-    let mut lows = Vec::with_capacity(rows.len());
-    let mut closes = Vec::with_capacity(rows.len());
-    for row in rows {
+    // Binance returns the still-forming candle as the last row.  It must not
+    // participate in a decision: its high, low and close can change until the
+    // interval ends, which makes a live signal appear stronger than a replay.
+    let closed_rows = rows.len().saturating_sub(1);
+    if closed_rows < 30 {
+        return Err(format!("{interval} has too few closed candles"));
+    }
+    let mut highs = Vec::with_capacity(closed_rows);
+    let mut lows = Vec::with_capacity(closed_rows);
+    let mut closes = Vec::with_capacity(closed_rows);
+    for row in rows.into_iter().take(closed_rows) {
         let parse = |index: usize| {
             row.get(index)
                 .and_then(Value::as_str)
@@ -295,26 +302,7 @@ fn calculate_indicators(highs: &[f64], lows: &[f64], closes: &[f64]) -> Option<I
     if atr <= 0.0 || !atr.is_finite() {
         return None;
     }
-    let period = (closes.len() - 1).min(14);
-    let start = closes.len() - period;
-    let (mut positive_dm, mut negative_dm) = (0.0, 0.0);
-    for index in start..closes.len() {
-        let upward = highs[index] - highs[index - 1];
-        let downward = lows[index - 1] - lows[index];
-        if upward > downward && upward > 0.0 {
-            positive_dm += upward;
-        }
-        if downward > upward && downward > 0.0 {
-            negative_dm += downward;
-        }
-    }
-    let positive_di = 100.0 * (positive_dm / period as f64) / atr;
-    let negative_di = 100.0 * (negative_dm / period as f64) / atr;
-    let adx = if positive_di + negative_di > f64::EPSILON {
-        100.0 * (positive_di - negative_di).abs() / (positive_di + negative_di)
-    } else {
-        0.0
-    };
+    let adx = wilder_adx(highs, lows, closes, 14)?;
     Some(Indicators {
         ema_fast,
         ema_slow,
@@ -322,6 +310,68 @@ fn calculate_indicators(highs: &[f64], lows: &[f64], closes: &[f64]) -> Option<I
         atr,
         adx,
     })
+}
+
+fn wilder_adx(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Option<f64> {
+    if period == 0 || highs.len() != lows.len() || lows.len() != closes.len() {
+        return None;
+    }
+    // A real ADX is the Wilder-smoothed average of DX readings.  The old code
+    // returned one unsmoothed DX reading and labelled it ADX.
+    if closes.len() < period * 2 + 1 {
+        return None;
+    }
+    let mut tr = Vec::with_capacity(closes.len() - 1);
+    let mut plus_dm = Vec::with_capacity(closes.len() - 1);
+    let mut minus_dm = Vec::with_capacity(closes.len() - 1);
+    for index in 1..closes.len() {
+        let upward = highs[index] - highs[index - 1];
+        let downward = lows[index - 1] - lows[index];
+        tr.push(
+            (highs[index] - lows[index])
+                .max((highs[index] - closes[index - 1]).abs())
+                .max((lows[index] - closes[index - 1]).abs()),
+        );
+        plus_dm.push(if upward > downward && upward > 0.0 {
+            upward
+        } else {
+            0.0
+        });
+        minus_dm.push(if downward > upward && downward > 0.0 {
+            downward
+        } else {
+            0.0
+        });
+    }
+    let mut smooth_tr: f64 = tr[..period].iter().sum();
+    let mut smooth_plus: f64 = plus_dm[..period].iter().sum();
+    let mut smooth_minus: f64 = minus_dm[..period].iter().sum();
+    let mut dx = Vec::with_capacity(tr.len() - period);
+    for index in period..tr.len() {
+        smooth_tr = smooth_tr - smooth_tr / period as f64 + tr[index];
+        smooth_plus = smooth_plus - smooth_plus / period as f64 + plus_dm[index];
+        smooth_minus = smooth_minus - smooth_minus / period as f64 + minus_dm[index];
+        if smooth_tr <= f64::EPSILON {
+            dx.push(0.0);
+            continue;
+        }
+        let plus_di = 100.0 * smooth_plus / smooth_tr;
+        let minus_di = 100.0 * smooth_minus / smooth_tr;
+        let sum = plus_di + minus_di;
+        dx.push(if sum > f64::EPSILON {
+            100.0 * (plus_di - minus_di).abs() / sum
+        } else {
+            0.0
+        });
+    }
+    if dx.len() < period {
+        return None;
+    }
+    let mut adx: f64 = dx[..period].iter().sum::<f64>() / period as f64;
+    for value in &dx[period..] {
+        adx = (adx * (period as f64 - 1.0) + value) / period as f64;
+    }
+    adx.is_finite().then_some(adx)
 }
 
 fn ema(values: &[f64], period: usize) -> Option<f64> {
