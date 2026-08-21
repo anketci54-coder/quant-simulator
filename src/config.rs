@@ -12,6 +12,7 @@ pub struct Config {
     pub panel_action_token: String,
     pub initial_balance: f64,
     pub entry_enabled: bool,
+    pub allow_short_entries: bool,
     pub max_positions: usize,
     pub max_same_side_positions: usize,
     pub max_entries_per_minute: usize,
@@ -58,6 +59,9 @@ impl Config {
             entry_enabled: env::var("ENTRY_ENABLED")
                 .map(|value| value.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            allow_short_entries: env::var("ALLOW_SHORT_ENTRIES")
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(true),
             max_positions: parse("MAX_POSITIONS", 5usize)?.clamp(1, 10),
             max_same_side_positions: parse("MAX_SAME_SIDE_POSITIONS", 3usize)?.clamp(1, 10),
             max_entries_per_minute: parse("MAX_ENTRIES_PER_MINUTE", 2usize)?.clamp(1, 10),
